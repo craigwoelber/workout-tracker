@@ -292,6 +292,61 @@ function SetInput({ setNumber, onSubmit, exercise, lastEntry }) {
   );
 }
 
+// ─── Edit Set Inline ───
+function EditSetInput({ setIndex, entry, onSave, onCancel }) {
+  const parsed = entry.split("×");
+  const isBW = parsed[0] === "BW";
+  const [weight, setWeight] = useState(isBW ? "" : parsed[0]);
+  const [reps, setReps] = useState(parsed[1] || "");
+  const weightRef = useRef(null);
+
+  useEffect(() => { setTimeout(() => weightRef.current?.focus(), 50); }, []);
+
+  const handleSave = () => {
+    if (!reps) return;
+    onSave(weight ? `${weight}×${reps}` : `BW×${reps}`);
+  };
+
+  const inp = {
+    width: "100%", padding: "10px 8px", background: "rgba(255,255,255,0.08)",
+    border: "2px solid #e94560", borderRadius: 8,
+    color: "#ccd6f6", fontSize: 18, fontWeight: 600, textAlign: "center",
+    outline: "none", fontFamily: "'JetBrains Mono',monospace"
+  };
+
+  return (
+    <div className="fade-in" style={{
+      background: "rgba(233,69,96,0.08)", border: "1px solid rgba(233,69,96,0.3)",
+      borderRadius: 10, padding: 10, minWidth: 200
+    }}>
+      <div style={{ color: "#e94560", fontSize: 10, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase", marginBottom: 6 }}>
+        Editing Set {setIndex + 1}
+      </div>
+      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+        <input ref={weightRef} type="number" inputMode="decimal" value={weight}
+          onChange={e => setWeight(e.target.value)} placeholder="BW"
+          onKeyDown={e => e.key === "Enter" && document.getElementById(`edit-reps-${setIndex}`)?.focus()}
+          style={{ ...inp, flex: 1 }} />
+        <span style={{ color: "#8892b0", fontSize: 16 }}>×</span>
+        <input id={`edit-reps-${setIndex}`} type="number" inputMode="numeric" value={reps}
+          onChange={e => setReps(e.target.value)} placeholder="0"
+          onKeyDown={e => e.key === "Enter" && handleSave()}
+          style={{ ...inp, flex: 1 }} />
+      </div>
+      <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+        <button onClick={onCancel} style={{
+          flex: 1, padding: "8px 0", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.15)",
+          borderRadius: 8, color: "#8892b0", fontSize: 13, cursor: "pointer", fontWeight: 600
+        }}>Cancel</button>
+        <button onClick={handleSave} style={{
+          flex: 1, padding: "8px 0", background: "#e94560", border: "none",
+          borderRadius: 8, color: "white", fontSize: 13, cursor: "pointer", fontWeight: 600
+        }}>Save</button>
+      </div>
+    </div>
+  );
+}
+
 // ─── Exercise History ───
 function ExerciseHistory({ history }) {
   if (!history || history.length === 0) return null;
@@ -309,6 +364,123 @@ function ExerciseHistory({ history }) {
           <span style={{ color: "#ccd6f6", fontSize: 13, fontFamily: "'JetBrains Mono',monospace" }}>{h.sets.join(" / ")}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+// ─── Exercise Progress Chart ───
+function ExerciseChart({ history }) {
+  if (!history || history.length < 2) return null;
+
+  // Parse sessions: max weight per session, avg reps per session
+  const sessions = history.map(h => {
+    let maxWeight = 0;
+    let totalReps = 0;
+    let repCount = 0;
+    let allBW = true;
+    for (const s of h.sets) {
+      const parts = s.split("×");
+      if (parts[0] !== "BW") {
+        const w = parseFloat(parts[0]) || 0;
+        if (w > maxWeight) maxWeight = w;
+        allBW = false;
+      }
+      totalReps += parseInt(parts[1]) || 0;
+      repCount++;
+    }
+    return {
+      label: h.week.replace("WEEK ", "W") + " D" + (h.day + 1),
+      weight: allBW ? null : maxWeight,
+      reps: repCount > 0 ? Math.round(totalReps / repCount) : 0
+    };
+  });
+
+  const hasWeight = sessions.some(s => s.weight !== null);
+  const weights = sessions.map(s => s.weight).filter(w => w !== null);
+  const repsArr = sessions.map(s => s.reps);
+
+  const wMin = hasWeight ? Math.min(...weights) : 0;
+  const wMax = hasWeight ? Math.max(...weights) : 0;
+  const rMin = Math.min(...repsArr);
+  const rMax = Math.max(...repsArr);
+
+  // Chart dimensions
+  const W = 380, H = 160, padL = 40, padR = 36, padT = 10, padB = 28;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+
+  const xStep = sessions.length > 1 ? plotW / (sessions.length - 1) : 0;
+  const x = (i) => padL + i * xStep;
+
+  // Scale functions with small buffer so lines don't sit on edges
+  const scaleW = (v) => {
+    if (wMax === wMin) return padT + plotH / 2;
+    return padT + plotH - ((v - wMin) / (wMax - wMin)) * plotH;
+  };
+  const scaleR = (v) => {
+    if (rMax === rMin) return padT + plotH / 2;
+    return padT + plotH - ((v - rMin) / (rMax - rMin)) * plotH;
+  };
+
+  const polyline = (pts) => pts.map(([px, py]) => `${px},${py}`).join(" ");
+
+  const weightPts = hasWeight ? sessions.map((s, i) => s.weight !== null ? [x(i), scaleW(s.weight)] : null).filter(Boolean) : [];
+  const repsPts = sessions.map((s, i) => [x(i), scaleR(s.reps)]);
+
+  return (
+    <div style={{ background: "rgba(255,255,255,0.04)", borderRadius: 12, padding: "12px 16px", marginTop: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <div style={{ color: "#8892b0", fontSize: 11, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase" }}>Progress</div>
+        <div style={{ display: "flex", gap: 12 }}>
+          {hasWeight && <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <div style={{ width: 10, height: 3, background: "#e94560", borderRadius: 2 }} />
+            <span style={{ color: "#8892b0", fontSize: 10 }}>Weight</span>
+          </div>}
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <div style={{ width: 10, height: 3, background: "#64ffda", borderRadius: 2 }} />
+            <span style={{ color: "#8892b0", fontSize: 10 }}>Reps</span>
+          </div>
+        </div>
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto" }}>
+        {/* Grid lines */}
+        {[0, 0.5, 1].map(f => (
+          <line key={f} x1={padL} y1={padT + plotH * (1 - f)} x2={W - padR} y2={padT + plotH * (1 - f)}
+            stroke="rgba(255,255,255,0.06)" strokeWidth="1" />
+        ))}
+        {/* Y-axis labels: weight left, reps right */}
+        {hasWeight && [wMin, wMax].map((v, i) => (
+          <text key={`w${i}`} x={padL - 6} y={i === 0 ? padT + plotH + 4 : padT + 4}
+            fill="#e94560" fontSize="9" textAnchor="end" fontFamily="'JetBrains Mono',monospace">{Math.round(v)}</text>
+        ))}
+        {[rMin, rMax].map((v, i) => (
+          <text key={`r${i}`} x={W - padR + 6} y={i === 0 ? padT + plotH + 4 : padT + 4}
+            fill="#64ffda" fontSize="9" textAnchor="start" fontFamily="'JetBrains Mono',monospace">{Math.round(v)}</text>
+        ))}
+        {/* X-axis labels */}
+        {sessions.map((s, i) => (
+          <text key={i} x={x(i)} y={H - 4} fill="#8892b0" fontSize="8" textAnchor="middle"
+            fontFamily="'JetBrains Mono',monospace">{s.label}</text>
+        ))}
+        {/* Weight line */}
+        {hasWeight && weightPts.length > 1 && (
+          <React.Fragment>
+            <polyline points={polyline(weightPts)} fill="none" stroke="#e94560" strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+            {weightPts.map(([px, py], i) => (
+              <circle key={i} cx={px} cy={py} r="4" fill="#e94560" />
+            ))}
+          </React.Fragment>
+        )}
+        {/* Reps line */}
+        {repsPts.length > 1 && (
+          <React.Fragment>
+            <polyline points={polyline(repsPts)} fill="none" stroke="#64ffda" strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+            {repsPts.map(([px, py], i) => (
+              <circle key={i} cx={px} cy={py} r="4" fill="#64ffda" />
+            ))}
+          </React.Fragment>
+        )}
+      </svg>
     </div>
   );
 }
@@ -344,6 +516,7 @@ function App() {
   const [err, setErr] = useState(null);
   const [settings, setSettings] = useState(false);
   const [view, setView] = useState("workout"); // workout | overview
+  const [editingSet, setEditingSet] = useState(null); // index of set being edited, or null
 
   // ─── Init: load from IDB, then fetch plan ───
   useEffect(() => {
@@ -404,6 +577,7 @@ function App() {
   };
 
   const advanceEx = () => {
+    setEditingSet(null);
     if (exIdx < curDay.exercises.length - 1) {
       setExIdx(exIdx + 1);
       setTimer(false);
@@ -417,6 +591,7 @@ function App() {
     const newLogs = [...curLogs, entry];
     const newAll = { ...logged, [curKey]: newLogs };
     saveLogs(newAll);
+    setEditingSet(null);
     setTimerLen(getRestSec(curEx.rest));
     setTimer(true);
   };
@@ -681,7 +856,7 @@ function App() {
       {/* Progress dots */}
       <div style={{ display: "flex", gap: 4, padding: "12px 20px", justifyContent: "center" }}>
         {curDay?.exercises.map((_, i) => (
-          <div key={i} onClick={() => { setExIdx(i); setTimer(false); }} style={{
+          <div key={i} onClick={() => { setExIdx(i); setTimer(false); setEditingSet(null); }} style={{
             width: i === exIdx ? 24 : 8, height: 8, borderRadius: 4, cursor: "pointer",
             background: exProgress[i] ? "#64ffda" : i === exIdx ? "#e94560" : "rgba(255,255,255,0.1)",
             transition: "all 0.3s ease"
@@ -710,13 +885,22 @@ function App() {
             {/* Logged sets */}
             {curLogs.length > 0 && (
               <div style={{ marginBottom: 16 }}>
-                <div style={{ color: "#8892b0", fontSize: 11, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Today</div>
+                <div style={{ color: "#8892b0", fontSize: 11, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Today<span style={{ color: "rgba(255,255,255,0.2)", fontSize: 10, marginLeft: 8 }}>tap to edit</span></div>
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                   {curLogs.map((entry, i) => (
-                    <div key={i} style={{ background: "rgba(100,255,218,0.1)", border: "1px solid rgba(100,255,218,0.2)", borderRadius: 10, padding: "8px 14px" }}>
-                      <div style={{ color: "#64ffda", fontSize: 11, fontWeight: 700 }}>Set {i + 1}</div>
-                      <div style={{ color: "#ccd6f6", fontSize: 15, fontWeight: 600, fontFamily: "'JetBrains Mono',monospace" }}>{entry}</div>
-                    </div>
+                    editingSet === i ? (
+                      <EditSetInput key={i} setIndex={i} entry={entry} onSave={(newEntry) => {
+                        const newLogs = [...curLogs];
+                        newLogs[i] = newEntry;
+                        saveLogs({ ...logged, [curKey]: newLogs });
+                        setEditingSet(null);
+                      }} onCancel={() => setEditingSet(null)} />
+                    ) : (
+                      <div key={i} onClick={() => setEditingSet(i)} style={{ background: "rgba(100,255,218,0.1)", border: "1px solid rgba(100,255,218,0.2)", borderRadius: 10, padding: "8px 14px", cursor: "pointer" }}>
+                        <div style={{ color: "#64ffda", fontSize: 11, fontWeight: 700 }}>Set {i + 1}</div>
+                        <div style={{ color: "#ccd6f6", fontSize: 15, fontWeight: 600, fontFamily: "'JetBrains Mono',monospace" }}>{entry}</div>
+                      </div>
+                    )
                   ))}
                 </div>
               </div>
@@ -768,10 +952,11 @@ function App() {
 
             {/* History */}
             <ExerciseHistory history={history[curEx.name]} />
+            <ExerciseChart history={history[curEx.name]} />
 
             {/* Nav */}
             <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
-              <button onClick={() => { if (exIdx > 0) { setExIdx(exIdx - 1); setTimer(false); } }} disabled={exIdx === 0}
+              <button onClick={() => { if (exIdx > 0) { setExIdx(exIdx - 1); setTimer(false); setEditingSet(null); } }} disabled={exIdx === 0}
                 style={{ flex: 1, padding: 14, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 12, color: exIdx === 0 ? "#333" : "#8892b0", fontSize: 14, cursor: exIdx === 0 ? "default" : "pointer", fontWeight: 600 }}>
                 ← Prev
               </button>

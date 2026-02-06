@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#0a192f">
+    <title>Workout Tracker</title>
+    <link rel="manifest" href="manifest.json">
+    <link rel="apple-touch-icon" href="icon-192.png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        *{box-sizing:border-box;margin:0;padding:0}
+        html,body,#root{min-height:100vh;min-height:100dvh;background:#0a192f}
+        body{font-family:'Outfit',system-ui,sans-serif;-webkit-tap-highlight-color:transparent;overscroll-behavior:none}
+        input,select,button{font-family:inherit}
+        input::-webkit-outer-spin-button,input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+        input[type=number]{-moz-appearance:textfield}
+        select option{background:#0a192f}
+        @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+        .fade-in{animation:fadeIn .3s ease-out}
+    </style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ══════════════════════════════════════════
+//  CONFIG
+// ══════════════════════════════════════════
+const SHEET_ID = "14SjL6EHtrmGMF84Y2mIQs-ZUPoeYSh_VQNfi-I1ukhQ";
+const WEEKS = ["WEEK 1","WEEK 2","WEEK 3","WEEK 4","WEEK 5","WEEK 6","WEEK 7","WEEK 8","DELOAD"];
+const DB_NAME = "WorkoutTrackerDB";
+const DB_VERSION = 1;
+
+// ══════════════════════════════════════════
+//  IndexedDB
+// ══════════════════════════════════════════
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains("kv")) db.createObjectStore("kv");
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbGet(key) {
+  const db = await openDB();
+  return new Promise((resolve) => {
+    const tx = db.transaction("kv", "readonly");
+    const req = tx.objectStore("kv").get(key);
+    req.onsuccess = () => resolve(req.result ?? null);
+    req.onerror = () => resolve(null);
+  });
+}
+
+async function dbSet(key, val) {
+  const db = await openDB();
+  return new Promise((resolve) => {
+    const tx = db.transaction("kv", "readwrite");
+    tx.objectStore("kv").put(val, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => resolve();
+  });
+}
+
+// ══════════════════════════════════════════
+//  Google Sheets Fetcher
+// ══════════════════════════════════════════
+function parseGviz(text) {
+  const json = JSON.parse(text.substring(text.indexOf("{"), text.lastIndexOf("}") + 1));
+  return json.table.rows.map(r => r.c.map(c => (c && c.v != null) ? String(c.v) : ""));
+}
+
+function parseWeek(rows, weekName) {
+  const days = [];
+  // Day 1 header is in merged cells that gviz skips
+  let currentDay = { name: "DAY 1 - PULL #1", exercises: [] };
+  for (const row of rows) {
+    const a = (row[0] || "").trim();
+    if (/^DAY\s+\d+/i.test(a)) {
+      if (currentDay?.exercises.length > 0) days.push(currentDay);
+      currentDay = { name: a, exercises: [] };
+      continue;
+    }
+    if (!a || a === "EXERCISE" || /fitnessfaq/i.test(a)) continue;
+    if (currentDay) {
+      currentDay.exercises.push({
+        name: a,
+        sets: parseInt(row[1]) || 3,
+        reps: (row[2] || "").trim(),
+        rest: (row[3] || "2").trim()
+      });
+    }
+  }
+  if (currentDay?.exercises.length > 0) days.push(currentDay);
+  return days;
+}
+
+async function fetchAllWeeks() {
+  const allData = {};
+  const fetches = WEEKS.map(async (week) => {
+    const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(week)}&range=A1:H70`;
+    const resp = await fetch(url);
+    const text = await resp.text();
+    allData[week] = parseWeek(parseGviz(text), week);
+  });
+  await Promise.all(fetches);
+  return allData;
+}
+
+// ══════════════════════════════════════════
+//  Components
+// ══════════════════════════════════════════
+
+// ─── Rest Timer ───
+function RestTimer({ duration, onComplete, onCancel }) {
+  const [remaining, setRemaining] = useState(duration);
+  const startRef = useRef(Date.now());
+  const audioRef = useRef(null);
+
+  useEffect(() => {
+    startRef.current = Date.now();
+    const iv = setInterval(() => {
+      const left = Math.max(0, duration - Math.floor((Date.now() - startRef.current) / 1000));
+      setRemaining(left);
+      if (left <= 0) {
+        clearInterval(iv);
+        // Vibrate if available
+        if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+        onComplete();
+      }
+    }, 250);
+    return () => clearInterval(iv);
+  }, [duration, onComplete]);
+
+  const mins = Math.floor(remaining / 60);
+  const secs = remaining % 60;
+  const progress = 1 - remaining / duration;
+  const circumference = 2 * Math.PI * 54;
+  const strokeDashoffset = circumference * (1 - progress);
+
+  return (
+    <div className="fade-in" style={{
+      background: "linear-gradient(135deg,#1a1a2e,#16213e)", borderRadius: 20,
+      padding: "32px 24px", textAlign: "center", border: "2px solid #e94560",
+      position: "relative", overflow: "hidden"
+    }}>
+      <div style={{ position: "absolute", top: 0, left: 0, height: "100%",
+        width: `${progress * 100}%`, background: "rgba(233,69,96,0.1)",
+        transition: "width 0.25s linear" }} />
+      <div style={{ position: "relative", zIndex: 1 }}>
+        {/* Circular progress */}
+        <div style={{ position: "relative", width: 140, height: 140, margin: "0 auto 16px" }}>
+          <svg width="140" height="140" style={{ transform: "rotate(-90deg)" }}>
+            <circle cx="70" cy="70" r="54" fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="8" />
+            <circle cx="70" cy="70" r="54" fill="none" stroke="#e94560" strokeWidth="8"
+              strokeLinecap="round" strokeDasharray={circumference}
+              strokeDashoffset={strokeDashoffset}
+              style={{ transition: "stroke-dashoffset 0.25s linear" }} />
+          </svg>
+          <div style={{
+            position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)",
+            fontFamily: "'JetBrains Mono',monospace", fontSize: 36, fontWeight: 700,
+            color: "#e94560", letterSpacing: 2
+          }}>
+            {mins}:{secs.toString().padStart(2, "0")}
+          </div>
+        </div>
+        <div style={{ color: "#8892b0", fontSize: 12, letterSpacing: 2, textTransform: "uppercase", marginBottom: 16 }}>
+          Rest Timer
+        </div>
+        <button onClick={onCancel} style={{
+          background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)",
+          color: "#ccd6f6", padding: "12px 32px", borderRadius: 12, fontSize: 15,
+          cursor: "pointer", fontWeight: 600, letterSpacing: 1
+        }}>Skip →</button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Set Input ───
+function SetInput({ setNumber, onSubmit, exercise }) {
+  const [weight, setWeight] = useState("");
+  const [reps, setReps] = useState("");
+  const weightRef = useRef(null);
+
+  useEffect(() => { setTimeout(() => weightRef.current?.focus(), 100); }, [setNumber]);
+
+  const handleSubmit = () => {
+    if (!reps) return;
+    onSubmit(weight ? `${weight}×${reps}` : `BW×${reps}`);
+    setWeight(""); setReps("");
+  };
+
+  const inp = {
+    width: "100%", padding: "16px 12px", background: "rgba(255,255,255,0.06)",
+    border: "2px solid rgba(255,255,255,0.12)", borderRadius: 12,
+    color: "#ccd6f6", fontSize: 22, fontWeight: 600, textAlign: "center",
+    outline: "none", fontFamily: "'JetBrains Mono',monospace"
+  };
+
+  return (
+    <div className="fade-in" style={{
+      background: "linear-gradient(135deg,#0f3460,#16213e)", borderRadius: 16,
+      padding: 20, border: "1px solid rgba(233,69,96,0.3)"
+    }}>
+      <div style={{ color: "#e94560", fontWeight: 700, fontSize: 13, letterSpacing: 2, textTransform: "uppercase", marginBottom: 16 }}>
+        Set {setNumber} of {exercise.sets}
+      </div>
+      <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
+        <div style={{ flex: 1 }}>
+          <label style={{ display: "block", color: "#8892b0", fontSize: 11, marginBottom: 6, letterSpacing: 1, textTransform: "uppercase" }}>Weight</label>
+          <input ref={weightRef} type="number" inputMode="decimal" value={weight}
+            onChange={e => setWeight(e.target.value)} placeholder="BW"
+            onKeyDown={e => e.key === "Enter" && document.getElementById("reps-input")?.focus()}
+            style={inp} />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={{ display: "block", color: "#8892b0", fontSize: 11, marginBottom: 6, letterSpacing: 1, textTransform: "uppercase" }}>Reps</label>
+          <input id="reps-input" type="number" inputMode="numeric" value={reps}
+            onChange={e => setReps(e.target.value)} placeholder="0"
+            onKeyDown={e => e.key === "Enter" && handleSubmit()} style={inp} />
+        </div>
+        <button onClick={handleSubmit} style={{
+          padding: "16px 20px", background: "#e94560", border: "none", borderRadius: 12,
+          color: "white", fontSize: 18, fontWeight: 700, cursor: "pointer",
+          whiteSpace: "nowrap", minHeight: 58
+        }}>Log ✓</button>
+      </div>
+      <div style={{ color: "#8892b0", fontSize: 13, marginTop: 12, textAlign: "center" }}>
+        Target: <span style={{ color: "#64ffda", fontWeight: 700 }}>{exercise.reps}</span> reps
+      </div>
+    </div>
+  );
+}
+
+// ─── Exercise History ───
+function ExerciseHistory({ history }) {
+  if (!history || history.length === 0) return null;
+  return (
+    <div style={{ background: "rgba(255,255,255,0.04)", borderRadius: 12, padding: "12px 16px", marginTop: 14 }}>
+      <div style={{ color: "#64ffda", fontSize: 11, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase", marginBottom: 8 }}>
+        Previous Sessions
+      </div>
+      {history.slice(-5).map((h, i) => (
+        <div key={i} style={{
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          padding: "7px 0", borderBottom: i < Math.min(history.length, 5) - 1 ? "1px solid rgba(255,255,255,0.06)" : "none"
+        }}>
+          <span style={{ color: "#8892b0", fontSize: 12 }}>{h.week} D{h.day + 1}</span>
+          <span style={{ color: "#ccd6f6", fontSize: 13, fontFamily: "'JetBrains Mono',monospace" }}>{h.sets.join(" / ")}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── Pill badge ───
+function Pill({ color, label, value }) {
+  const bg = color === "green" ? "rgba(100,255,218,0.1)" : color === "red" ? "rgba(233,69,96,0.1)" : "rgba(255,255,255,0.06)";
+  const fg = color === "green" ? "#64ffda" : color === "red" ? "#e94560" : "#ccd6f6";
+  return (
+    <div style={{ background: bg, borderRadius: 8, padding: "6px 14px", display: "inline-flex", alignItems: "center", gap: 6 }}>
+      <span style={{ color: fg, fontSize: 13, fontWeight: 700 }}>{value}</span>
+      <span style={{ color: "#8892b0", fontSize: 11 }}>{label}</span>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════
+//  Main App
+// ══════════════════════════════════════════
+function App() {
+  const [plan, setPlan] = useState(null); // { "WEEK 1": [{name, exercises}], ... }
+  const [weekIdx, setWeekIdx] = useState(0);
+  const [dayIdx, setDayIdx] = useState(0);
+  const [exIdx, setExIdx] = useState(0);
+  const [logged, setLogged] = useState({}); // "W0|D0|ExName" -> ["135×8", ...]
+  const [history, setHistory] = useState({}); // "ExName" -> [{week, day, sets}]
+  const [timer, setTimer] = useState(false);
+  const [timerLen, setTimerLen] = useState(60);
+  const [defTimer, setDefTimer] = useState(60);
+  const [started, setStarted] = useState(false);
+  const [complete, setComplete] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+  const [settings, setSettings] = useState(false);
+  const [view, setView] = useState("workout"); // workout | overview
+
+  // ─── Init: load from IDB, then fetch plan ───
+  useEffect(() => {
+    (async () => {
+      try {
+        // Load saved state
+        const [savedState, savedLogged, savedHistory, savedPlan] = await Promise.all([
+          dbGet("state"), dbGet("logged"), dbGet("history"), dbGet("plan")
+        ]);
+        if (savedState) {
+          setWeekIdx(savedState.weekIdx ?? 0);
+          setDayIdx(savedState.dayIdx ?? 0);
+          setDefTimer(savedState.defTimer ?? 60);
+        }
+        if (savedLogged) setLogged(savedLogged);
+        if (savedHistory) setHistory(savedHistory);
+
+        // Try fetching fresh plan from sheet
+        try {
+          const freshPlan = await fetchAllWeeks();
+          setPlan(freshPlan);
+          await dbSet("plan", freshPlan);
+        } catch (e) {
+          // Offline - use cached plan
+          if (savedPlan) {
+            setPlan(savedPlan);
+          } else {
+            throw new Error("No cached data and can't reach Google Sheets. Please connect to the internet for initial setup.");
+          }
+        }
+        setLoading(false);
+      } catch (e) {
+        setErr(e.message);
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  // ─── Helpers ───
+  const save = useCallback(async (wk, dy, tmr) => {
+    await dbSet("state", { weekIdx: wk, dayIdx: dy, defTimer: tmr });
+  }, []);
+
+  const saveLogs = useCallback(async (l) => { setLogged(l); await dbSet("logged", l); }, []);
+  const saveHist = useCallback(async (h) => { setHistory(h); await dbSet("history", h); }, []);
+
+  const curWeek = plan ? plan[WEEKS[weekIdx]] : null;
+  const curDay = curWeek?.[dayIdx];
+  const curEx = curDay?.exercises[exIdx];
+  const logKey = (w, d, name) => `W${w}|D${d}|${name}`;
+  const curKey = curEx ? logKey(weekIdx, dayIdx, curEx.name) : "";
+  const curLogs = logged[curKey] || [];
+
+  const getRestSec = (r) => {
+    if (!r) return defTimer;
+    const m = r.match(/(\d+)/);
+    return m ? parseInt(m[1]) * 60 : defTimer;
+  };
+
+  const advanceEx = () => {
+    if (exIdx < curDay.exercises.length - 1) {
+      setExIdx(exIdx + 1);
+      setTimer(false);
+    } else {
+      setComplete(true);
+      setTimer(false);
+    }
+  };
+
+  const handleLog = (entry) => {
+    const newLogs = [...curLogs, entry];
+    const newAll = { ...logged, [curKey]: newLogs };
+    saveLogs(newAll);
+    setTimerLen(getRestSec(curEx.rest));
+    setTimer(true);
+  };
+
+  const handleTimerDone = useCallback(() => {
+    setTimer(false);
+    // Check if exercise is complete and auto-advance
+    const key = curEx ? logKey(weekIdx, dayIdx, curEx.name) : "";
+    const logs = logged[key] || [];
+    // Need to check with the potentially updated logged state
+    // Since handleLog updates logged before starting timer, logs should reflect the new set
+  }, [curEx, weekIdx, dayIdx, logged]);
+
+  // After timer, check if we should auto-advance
+  useEffect(() => {
+    if (!timer && curEx && started && !complete) {
+      const logs = logged[curKey] || [];
+      if (logs.length >= curEx.sets) {
+        advanceEx();
+      }
+    }
+  }, [timer]);
+
+  const handleFinish = async () => {
+    const newHist = { ...history };
+    for (const ex of curDay.exercises) {
+      const k = logKey(weekIdx, dayIdx, ex.name);
+      const sets = logged[k] || [];
+      if (sets.length > 0) {
+        if (!newHist[ex.name]) newHist[ex.name] = [];
+        newHist[ex.name].push({ week: WEEKS[weekIdx], day: dayIdx, sets: [...sets] });
+      }
+    }
+    await saveHist(newHist);
+
+    // Clear logged sets for this day's exercises
+    const newLogged = { ...logged };
+    for (const ex of curDay.exercises) {
+      delete newLogged[logKey(weekIdx, dayIdx, ex.name)];
+    }
+    await saveLogs(newLogged);
+
+    // Advance day
+    let nw = weekIdx, nd = dayIdx + 1;
+    if (nd >= curWeek.length) { nd = 0; nw = Math.min(weekIdx + 1, WEEKS.length - 1); }
+    setWeekIdx(nw); setDayIdx(nd); setExIdx(0);
+    setComplete(false); setStarted(false);
+    await save(nw, nd, defTimer);
+  };
+
+  const skipDay = async () => {
+    let nw = weekIdx, nd = dayIdx + 1;
+    if (nd >= curWeek.length) { nd = 0; nw = Math.min(weekIdx + 1, WEEKS.length - 1); }
+    setWeekIdx(nw); setDayIdx(nd); setExIdx(0);
+    setComplete(false); setStarted(false); setTimer(false);
+    await save(nw, nd, defTimer);
+  };
+
+  // ─── Loading / Error ───
+  if (loading) return (
+    <div style={{ minHeight: "100dvh", display: "flex", alignItems: "center", justifyContent: "center", background: "#0a192f", color: "#64ffda" }}>
+      <div style={{ textAlign: "center" }}>
+        <div style={{ fontSize: 48, marginBottom: 16 }}>🏋️</div>
+        <div style={{ fontSize: 13, letterSpacing: 3, textTransform: "uppercase", fontFamily: "'JetBrains Mono',monospace", animation: "pulse 1.5s infinite" }}>
+          Loading Workout Plan...
+        </div>
+      </div>
+    </div>
+  );
+
+  if (err) return (
+    <div style={{ minHeight: "100dvh", display: "flex", alignItems: "center", justifyContent: "center", background: "#0a192f", color: "#e94560", padding: 24 }}>
+      <div style={{ textAlign: "center", maxWidth: 360 }}>
+        <div style={{ fontSize: 48, marginBottom: 16 }}>⚠️</div>
+        <div style={{ fontSize: 15, lineHeight: 1.6 }}>{err}</div>
+      </div>
+    </div>
+  );
+
+  const cs = {
+    minHeight: "100dvh", background: "#0a192f", color: "#ccd6f6",
+    maxWidth: 480, margin: "0 auto", paddingBottom: 60
+  };
+
+  // ─── Settings ───
+  if (settings) return (
+    <div style={cs}>
+      <div style={{ padding: "20px 20px 0" }}>
+        <button onClick={() => setSettings(false)} style={{ background: "none", border: "none", color: "#64ffda", fontSize: 15, cursor: "pointer", fontWeight: 600 }}>← Back</button>
+      </div>
+      <div style={{ padding: 20 }}>
+        <h2 style={{ color: "#ccd6f6", fontSize: 22, fontWeight: 700, marginBottom: 28 }}>Settings</h2>
+
+        <div style={{ marginBottom: 28 }}>
+          <label style={{ display: "block", color: "#8892b0", fontSize: 12, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Default Rest Timer (sec)</label>
+          <input type="number" value={defTimer} onChange={e => { const v = parseInt(e.target.value) || 60; setDefTimer(v); save(weekIdx, dayIdx, v); }}
+            style={{ width: "100%", padding: 14, background: "rgba(255,255,255,0.06)", border: "2px solid rgba(255,255,255,0.12)", borderRadius: 12, color: "#ccd6f6", fontSize: 20, outline: "none", fontFamily: "'JetBrains Mono',monospace", textAlign: "center" }} />
+        </div>
+
+        <div style={{ marginBottom: 28 }}>
+          <label style={{ display: "block", color: "#8892b0", fontSize: 12, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Current Week</label>
+          <select value={weekIdx} onChange={e => { const i = parseInt(e.target.value); setWeekIdx(i); setDayIdx(0); setExIdx(0); setStarted(false); setComplete(false); save(i, 0, defTimer); }}
+            style={{ width: "100%", padding: 14, background: "rgba(255,255,255,0.06)", border: "2px solid rgba(255,255,255,0.12)", borderRadius: 12, color: "#ccd6f6", fontSize: 16, outline: "none" }}>
+            {WEEKS.map((w, i) => <option key={w} value={i}>{w}</option>)}
+          </select>
+        </div>
+
+        <div style={{ marginBottom: 28 }}>
+          <label style={{ display: "block", color: "#8892b0", fontSize: 12, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Current Day</label>
+          <select value={dayIdx} onChange={e => { const i = parseInt(e.target.value); setDayIdx(i); setExIdx(0); setStarted(false); setComplete(false); save(weekIdx, i, defTimer); }}
+            style={{ width: "100%", padding: 14, background: "rgba(255,255,255,0.06)", border: "2px solid rgba(255,255,255,0.12)", borderRadius: 12, color: "#ccd6f6", fontSize: 16, outline: "none" }}>
+            {curWeek?.map((d, i) => <option key={i} value={i}>{d.name}</option>)}
+          </select>
+        </div>
+
+        <div style={{ background: "rgba(233,69,96,0.08)", border: "1px solid rgba(233,69,96,0.25)", borderRadius: 14, padding: 20, marginTop: 40 }}>
+          <div style={{ color: "#e94560", fontWeight: 700, fontSize: 14, marginBottom: 10 }}>Danger Zone</div>
+          <button onClick={async () => {
+            if (confirm("Clear ALL logged workout data and history? This cannot be undone.")) {
+              await dbSet("logged", {});
+              await dbSet("history", {});
+              setLogged({}); setHistory({});
+            }
+          }} style={{
+            padding: "12px 24px", background: "rgba(233,69,96,0.15)", border: "1px solid #e94560",
+            borderRadius: 10, color: "#e94560", fontSize: 14, cursor: "pointer", fontWeight: 600
+          }}>Clear All History</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ─── Overview ───
+  if (view === "overview") return (
+    <div style={cs}>
+      <div style={{ padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+        <button onClick={() => setView("workout")} style={{ background: "none", border: "none", color: "#64ffda", fontSize: 15, cursor: "pointer", fontWeight: 600 }}>← Back</button>
+        <span style={{ color: "#8892b0", fontSize: 13 }}>{WEEKS[weekIdx]}</span>
+      </div>
+      <div style={{ padding: 20 }}>
+        <h2 style={{ color: "#ccd6f6", fontSize: 21, fontWeight: 700, marginBottom: 20 }}>{curDay?.name}</h2>
+        {curDay?.exercises.map((ex, i) => {
+          const k = logKey(weekIdx, dayIdx, ex.name);
+          const logs = logged[k] || [];
+          const done = logs.length >= ex.sets;
+          return (
+            <div key={i} className="fade-in" style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              padding: "14px 0", borderBottom: "1px solid rgba(255,255,255,0.06)",
+              opacity: done ? 0.5 : 1, animationDelay: `${i * 40}ms`
+            }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 600, fontSize: 15 }}>{done ? "✅ " : ""}{ex.name}</div>
+                <div style={{ color: "#8892b0", fontSize: 12, marginTop: 3 }}>{ex.sets} × {ex.reps} · {ex.rest}min rest</div>
+                {logs.length > 0 && <div style={{ color: "#64ffda", fontSize: 12, marginTop: 4, fontFamily: "'JetBrains Mono',monospace", overflow: "hidden", textOverflow: "ellipsis" }}>{logs.join(" / ")}</div>}
+              </div>
+              <button onClick={() => { setExIdx(i); setStarted(true); setView("workout"); }}
+                style={{ background: done ? "rgba(255,255,255,0.04)" : "rgba(100,255,218,0.1)", border: done ? "1px solid rgba(255,255,255,0.1)" : "1px solid rgba(100,255,218,0.3)", borderRadius: 10, padding: "10px 16px", color: done ? "#8892b0" : "#64ffda", fontSize: 13, cursor: "pointer", fontWeight: 600, flexShrink: 0, marginLeft: 12 }}>
+                {done ? "Redo" : "Go →"}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+
+  // ─── Workout Complete ───
+  if (complete) return (
+    <div style={cs}>
+      <div className="fade-in" style={{ padding: "50px 24px", textAlign: "center" }}>
+        <div style={{ fontSize: 64, marginBottom: 16 }}>💪</div>
+        <h2 style={{ color: "#64ffda", fontSize: 24, fontWeight: 700, marginBottom: 8 }}>Workout Complete!</h2>
+        <p style={{ color: "#8892b0", fontSize: 14, marginBottom: 28 }}>{curDay?.name} — {WEEKS[weekIdx]}</p>
+        <div style={{ background: "rgba(255,255,255,0.04)", borderRadius: 16, padding: 20, textAlign: "left", marginBottom: 28 }}>
+          {curDay?.exercises.map((ex, i) => {
+            const logs = logged[logKey(weekIdx, dayIdx, ex.name)] || [];
+            return (
+              <div key={i} style={{ padding: "10px 0", borderBottom: i < curDay.exercises.length - 1 ? "1px solid rgba(255,255,255,0.06)" : "none" }}>
+                <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 4 }}>{ex.name}</div>
+                <div style={{ color: "#64ffda", fontSize: 13, fontFamily: "'JetBrains Mono',monospace" }}>{logs.join(" / ") || "— skipped"}</div>
+              </div>
+            );
+          })}
+        </div>
+        <button onClick={handleFinish} style={{ width: "100%", padding: 18, background: "#64ffda", border: "none", borderRadius: 14, color: "#0a192f", fontSize: 17, fontWeight: 700, cursor: "pointer", letterSpacing: 1 }}>
+          Save & Next Day →
+        </button>
+        <button onClick={() => { setComplete(false); setView("overview"); }} style={{ width: "100%", padding: 14, background: "transparent", border: "1px solid rgba(255,255,255,0.15)", borderRadius: 14, color: "#8892b0", fontSize: 14, fontWeight: 600, cursor: "pointer", marginTop: 10 }}>
+          Review Exercises
+        </button>
+      </div>
+    </div>
+  );
+
+  // ─── Start Screen ───
+  if (!started) return (
+    <div style={cs}>
+      <div style={{ padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+        <div style={{ color: "#64ffda", fontSize: 11, letterSpacing: 2, textTransform: "uppercase", fontWeight: 700 }}>Hybrid PPL</div>
+        <button onClick={() => setSettings(true)} style={{ background: "rgba(255,255,255,0.06)", border: "none", borderRadius: 8, padding: "8px 14px", color: "#8892b0", cursor: "pointer", fontSize: 16 }}>⚙️</button>
+      </div>
+      <div style={{ padding: "28px 20px" }}>
+        {/* Week pills */}
+        <div style={{ display: "flex", gap: 6, marginBottom: 24, flexWrap: "wrap" }}>
+          {WEEKS.map((w, i) => (
+            <div key={w} style={{
+              padding: "6px 12px", borderRadius: 20, fontSize: 11, fontWeight: 700, letterSpacing: 1,
+              background: i === weekIdx ? "#64ffda" : "rgba(255,255,255,0.06)",
+              color: i === weekIdx ? "#0a192f" : i < weekIdx ? "#64ffda" : "#8892b0",
+              border: i < weekIdx ? "1px solid rgba(100,255,218,0.3)" : "1px solid transparent",
+              cursor: "pointer"
+            }} onClick={() => { setWeekIdx(i); setDayIdx(0); setExIdx(0); save(i, 0, defTimer); }}>
+              {w.replace("WEEK ", "W")}
+            </div>
+          ))}
+        </div>
+
+        {/* Day card */}
+        <div className="fade-in" style={{
+          background: "linear-gradient(135deg,#112240,#0f3460)", borderRadius: 20,
+          padding: 28, marginBottom: 20, border: "1px solid rgba(100,255,218,0.15)"
+        }}>
+          <div style={{ color: "#8892b0", fontSize: 12, letterSpacing: 2, textTransform: "uppercase", marginBottom: 8 }}>Up Next</div>
+          <h1 style={{ color: "#ccd6f6", fontSize: 26, fontWeight: 800, marginBottom: 4, lineHeight: 1.2 }}>{curDay?.name}</h1>
+          <div style={{ color: "#8892b0", fontSize: 14, marginBottom: 20 }}>{curDay?.exercises.length} exercises · {WEEKS[weekIdx]}</div>
+
+          {curDay?.exercises.map((ex, i) => (
+            <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "9px 0", borderBottom: i < curDay.exercises.length - 1 ? "1px solid rgba(255,255,255,0.06)" : "none" }}>
+              <span style={{ color: "#ccd6f6", fontSize: 14 }}>{ex.name}</span>
+              <span style={{ color: "#8892b0", fontSize: 13 }}>{ex.sets} × {ex.reps}</span>
+            </div>
+          ))}
+
+          <button onClick={() => setStarted(true)} style={{
+            width: "100%", padding: 18, background: "#64ffda", border: "none", borderRadius: 14,
+            color: "#0a192f", fontSize: 17, fontWeight: 700, cursor: "pointer", letterSpacing: 1, marginTop: 20
+          }}>Start Workout 🏋️</button>
+        </div>
+
+        <button onClick={skipDay} style={{ width: "100%", padding: 14, background: "transparent", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 14, color: "#8892b0", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+          Skip This Day →
+        </button>
+      </div>
+    </div>
+  );
+
+  // ─── Active Workout ───
+  const exProgress = curDay?.exercises.map((ex, i) => (logged[logKey(weekIdx, dayIdx, ex.name)] || []).length >= ex.sets) || [];
+  const doneCount = exProgress.filter(Boolean).length;
+  const totalEx = curDay?.exercises.length || 0;
+
+  return (
+    <div style={cs}>
+      {/* Sticky header */}
+      <div style={{ padding: "12px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.06)", position: "sticky", top: 0, background: "#0a192f", zIndex: 10 }}>
+        <button onClick={() => setView("overview")} style={{ background: "none", border: "none", color: "#8892b0", fontSize: 14, cursor: "pointer", fontWeight: 600 }}>☰ All</button>
+        <div style={{ color: "#8892b0", fontSize: 12, fontWeight: 600 }}>{curDay?.name}</div>
+        <div style={{ color: "#64ffda", fontSize: 12, fontWeight: 700 }}>{doneCount}/{totalEx}</div>
+      </div>
+
+      {/* Progress dots */}
+      <div style={{ display: "flex", gap: 4, padding: "12px 20px", justifyContent: "center" }}>
+        {curDay?.exercises.map((_, i) => (
+          <div key={i} onClick={() => { setExIdx(i); setTimer(false); }} style={{
+            width: i === exIdx ? 24 : 8, height: 8, borderRadius: 4, cursor: "pointer",
+            background: exProgress[i] ? "#64ffda" : i === exIdx ? "#e94560" : "rgba(255,255,255,0.1)",
+            transition: "all 0.3s ease"
+          }} />
+        ))}
+      </div>
+
+      <div style={{ padding: "8px 20px 20px" }}>
+        {curEx && (
+          <div className="fade-in" key={exIdx}>
+            {/* Exercise header */}
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ color: "#8892b0", fontSize: 11, letterSpacing: 2, textTransform: "uppercase", marginBottom: 6 }}>
+                Exercise {exIdx + 1} of {totalEx}
+              </div>
+              <h2 style={{ color: "#ccd6f6", fontSize: 28, fontWeight: 800, lineHeight: 1.2, marginBottom: 10 }}>
+                {curEx.name}
+              </h2>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <Pill color="green" value={curEx.reps} label="reps" />
+                <Pill color="red" value={curEx.sets} label="sets" />
+                <Pill color="gray" value={curEx.rest} label="min rest" />
+              </div>
+            </div>
+
+            {/* Logged sets */}
+            {curLogs.length > 0 && (
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ color: "#8892b0", fontSize: 11, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Today</div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  {curLogs.map((entry, i) => (
+                    <div key={i} style={{ background: "rgba(100,255,218,0.1)", border: "1px solid rgba(100,255,218,0.2)", borderRadius: 10, padding: "8px 14px" }}>
+                      <div style={{ color: "#64ffda", fontSize: 11, fontWeight: 700 }}>Set {i + 1}</div>
+                      <div style={{ color: "#ccd6f6", fontSize: 15, fontWeight: 600, fontFamily: "'JetBrains Mono',monospace" }}>{entry}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Timer / Input / Done */}
+            {timer ? (
+              <RestTimer duration={timerLen} onComplete={handleTimerDone}
+                onCancel={() => { setTimer(false); if (curLogs.length >= curEx.sets) advanceEx(); }} />
+            ) : curLogs.length < curEx.sets ? (
+              <SetInput setNumber={curLogs.length + 1} exercise={curEx} onSubmit={handleLog} />
+            ) : (
+              <div className="fade-in" style={{ textAlign: "center", padding: 24 }}>
+                <div style={{ color: "#64ffda", fontSize: 18, fontWeight: 700, marginBottom: 14 }}>✅ All sets complete!</div>
+                <button onClick={advanceEx} style={{ padding: "14px 32px", background: "#64ffda", border: "none", borderRadius: 12, color: "#0a192f", fontSize: 16, fontWeight: 700, cursor: "pointer" }}>
+                  Next Exercise →
+                </button>
+              </div>
+            )}
+
+            {/* History */}
+            <ExerciseHistory history={history[curEx.name]} />
+
+            {/* Nav */}
+            <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+              <button onClick={() => { if (exIdx > 0) { setExIdx(exIdx - 1); setTimer(false); } }} disabled={exIdx === 0}
+                style={{ flex: 1, padding: 14, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 12, color: exIdx === 0 ? "#333" : "#8892b0", fontSize: 14, cursor: exIdx === 0 ? "default" : "pointer", fontWeight: 600 }}>
+                ← Prev
+              </button>
+              <button onClick={advanceEx}
+                style={{ flex: 1, padding: 14, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 12, color: "#8892b0", fontSize: 14, cursor: "pointer", fontWeight: 600 }}>
+                Skip →
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+<script>
+// Register service worker
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>

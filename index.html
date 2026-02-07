@@ -41,6 +41,11 @@ const WEEKS = ["WEEK 1","WEEK 2","WEEK 3","WEEK 4","WEEK 5","WEEK 6","WEEK 7","W
 const DB_NAME = "WorkoutTrackerDB";
 const DB_VERSION = 1;
 
+// ExerciseDB API
+const EXERCISEDB_HOST = "exercisedb.p.rapidapi.com";
+const EXERCISEDB_KEY = "6053294d2cmsh784416a9d0bf043p1c1eecjsn4b4efb735ed8";
+const EXERCISEDB_HEADERS = { "X-RapidAPI-Key": EXERCISEDB_KEY, "X-RapidAPI-Host": EXERCISEDB_HOST };
+
 // ══════════════════════════════════════════
 //  IndexedDB
 // ══════════════════════════════════════════
@@ -119,6 +124,52 @@ async function fetchAllWeeks() {
   });
   await Promise.all(fetches);
   return allData;
+}
+
+// ══════════════════════════════════════════
+//  ExerciseDB API
+// ══════════════════════════════════════════
+async function searchExercises(query) {
+  const resp = await fetch(
+    `https://${EXERCISEDB_HOST}/exercises/name/${encodeURIComponent(query.toLowerCase())}?limit=20&offset=0`,
+    { headers: EXERCISEDB_HEADERS }
+  );
+  if (!resp.ok) throw new Error("API request failed");
+  return resp.json();
+}
+
+async function fetchBodyPartList() {
+  const resp = await fetch(`https://${EXERCISEDB_HOST}/exercises/bodyPartList`, { headers: EXERCISEDB_HEADERS });
+  if (!resp.ok) throw new Error("API request failed");
+  return resp.json();
+}
+
+async function fetchByBodyPart(bodyPart) {
+  const resp = await fetch(
+    `https://${EXERCISEDB_HOST}/exercises/bodyPart/${encodeURIComponent(bodyPart)}?limit=30&offset=0`,
+    { headers: EXERCISEDB_HEADERS }
+  );
+  if (!resp.ok) throw new Error("API request failed");
+  return resp.json();
+}
+
+async function fetchByEquipment(equipment) {
+  const resp = await fetch(
+    `https://${EXERCISEDB_HOST}/exercises/equipment/${encodeURIComponent(equipment)}?limit=50&offset=0`,
+    { headers: EXERCISEDB_HEADERS }
+  );
+  if (!resp.ok) throw new Error("API request failed");
+  return resp.json();
+}
+
+async function fetchEquipmentList() {
+  const resp = await fetch(`https://${EXERCISEDB_HOST}/exercises/equipmentList`, { headers: EXERCISEDB_HEADERS });
+  if (!resp.ok) throw new Error("API request failed");
+  return resp.json();
+}
+
+function exerciseImageUrl(id) {
+  return `https://${EXERCISEDB_HOST}/image?exerciseId=${id}&resolution=180`;
 }
 
 // ══════════════════════════════════════════
@@ -497,6 +548,649 @@ function Pill({ color, label, value }) {
   );
 }
 
+// ─── Bottom Nav ───
+function BottomNav({ tab, onTabChange }) {
+  const tabStyle = (active) => ({
+    flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
+    padding: "10px 0 8px", background: "none", border: "none",
+    color: active ? "#64ffda" : "#8892b0", fontSize: 11, fontWeight: 600,
+    cursor: "pointer", letterSpacing: 1, textTransform: "uppercase",
+    borderTop: active ? "2px solid #64ffda" : "2px solid transparent",
+    transition: "all 0.2s ease"
+  });
+  return (
+    <div style={{
+      position: "fixed", bottom: 0, left: 0, right: 0,
+      background: "#0a192f", borderTop: "1px solid rgba(255,255,255,0.08)",
+      display: "flex", maxWidth: 480, margin: "0 auto", zIndex: 100
+    }}>
+      <button onClick={() => onTabChange("workout")} style={tabStyle(tab === "workout")}>
+        <span style={{ fontSize: 20 }}>🏋️</span>
+        Workout
+      </button>
+      <button onClick={() => onTabChange("build")} style={tabStyle(tab === "build")}>
+        <span style={{ fontSize: 20 }}>🔧</span>
+        Build
+      </button>
+    </div>
+  );
+}
+
+// ─── Exercise Image (fetches with API key headers) ───
+const gifCache = {};
+function ExerciseGif({ exerciseId, size }) {
+  const [src, setSrc] = useState(gifCache[exerciseId] || null);
+  useEffect(() => {
+    if (!exerciseId || gifCache[exerciseId]) return;
+    let cancelled = false;
+    fetch(exerciseImageUrl(exerciseId), { headers: EXERCISEDB_HEADERS })
+      .then(r => r.blob())
+      .then(blob => {
+        const url = URL.createObjectURL(blob);
+        gifCache[exerciseId] = url;
+        if (!cancelled) setSrc(url);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [exerciseId]);
+
+  const s = size || 56;
+  if (!src) return (
+    <div style={{ width: s, height: s, borderRadius: 10, flexShrink: 0, background: "rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ width: 16, height: 16, border: "2px solid #64ffda", borderTopColor: "transparent", borderRadius: "50%", animation: "pulse 0.8s linear infinite" }} />
+    </div>
+  );
+  return <img src={src} alt="" style={{ width: s, height: s, borderRadius: 10, objectFit: "cover", background: "rgba(255,255,255,0.06)", flexShrink: 0 }} />;
+}
+
+// ─── Exercise Search ───
+function ExerciseSearch({ onSelect, onBack }) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState([]);
+  const [bodyParts, setBodyParts] = useState([]);
+  const [selectedPart, setSelectedPart] = useState(null);
+  const [selectedEquipment, setSelectedEquipment] = useState(null);
+  const [searching, setSearching] = useState(false);
+  const [error, setError] = useState(null);
+  const [expanded, setExpanded] = useState(null);
+  const [equipmentList, setEquipmentList] = useState([]);
+  const searchTimer = useRef(null);
+
+  // Load body part + equipment lists on mount
+  useEffect(() => {
+    fetchBodyPartList().then(setBodyParts).catch(() => {});
+    fetchEquipmentList().then(setEquipmentList).catch(() => {});
+  }, []);
+
+  // Unified fetch: triggers when query, selectedPart, or selectedEquipment changes
+  useEffect(() => {
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    const hasFilter = query.trim() || selectedPart || selectedEquipment;
+    if (!hasFilter) { setResults([]); return; }
+
+    searchTimer.current = setTimeout(async () => {
+      setSearching(true); setError(null); setExpanded(null);
+      try {
+        let data;
+        // Pick the most specific API fetch, then cross-filter the rest client-side
+        if (query.trim()) {
+          data = await searchExercises(query.trim());
+        } else if (selectedPart && selectedEquipment) {
+          // Fetch by body part (usually smaller set), filter by equipment
+          data = await fetchByBodyPart(selectedPart);
+        } else if (selectedPart) {
+          data = await fetchByBodyPart(selectedPart);
+        } else {
+          data = await fetchByEquipment(selectedEquipment);
+        }
+        // Client-side cross-filters for anything not handled by the API call
+        if (selectedPart && query.trim()) data = data.filter(ex => ex.bodyPart === selectedPart);
+        if (selectedEquipment && (query.trim() || selectedPart)) data = data.filter(ex => ex.equipment === selectedEquipment);
+        setResults(data);
+      } catch (e) { setError("Search failed. Check your connection."); }
+      setSearching(false);
+    }, query.trim() ? 500 : 0);
+    return () => clearTimeout(searchTimer.current);
+  }, [query, selectedPart, selectedEquipment]);
+
+  const handleBodyPart = (part) => {
+    setSelectedPart(selectedPart === part ? null : part);
+    setQuery("");
+  };
+
+  const handleEquipment = (eq) => {
+    setSelectedEquipment(selectedEquipment === eq ? null : eq);
+    setQuery("");
+  };
+
+  return (
+    <div style={{ padding: "0 20px 80px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+        {onBack && <button onClick={onBack} style={{ background: "none", border: "none", color: "#64ffda", fontSize: 15, cursor: "pointer", fontWeight: 600, flexShrink: 0 }}>←</button>}
+        <input
+          type="text" value={query} onChange={e => setQuery(e.target.value)}
+          placeholder="Search exercises..."
+          style={{
+            flex: 1, padding: "14px 16px", background: "rgba(255,255,255,0.06)",
+            border: "2px solid rgba(255,255,255,0.12)", borderRadius: 12,
+            color: "#ccd6f6", fontSize: 16, outline: "none"
+          }}
+        />
+      </div>
+
+      {/* Body part chips */}
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ color: "#8892b0", fontSize: 10, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Body Part</div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {bodyParts.map(part => (
+            <button key={part} onClick={() => handleBodyPart(part)} style={{
+              padding: "6px 12px", borderRadius: 16, fontSize: 11, fontWeight: 600,
+              textTransform: "capitalize", cursor: "pointer", border: "none",
+              background: selectedPart === part ? "#64ffda" : "rgba(255,255,255,0.06)",
+              color: selectedPart === part ? "#0a192f" : "#ccd6f6",
+              transition: "all 0.2s ease"
+            }}>{part}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Equipment chips */}
+      {equipmentList.length > 0 && (
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ color: "#8892b0", fontSize: 10, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Equipment</div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {equipmentList.map(eq => (
+              <button key={eq} onClick={() => handleEquipment(eq)} style={{
+                padding: "6px 12px", borderRadius: 16, fontSize: 11, fontWeight: 600,
+                cursor: "pointer", border: "none", textTransform: "capitalize",
+                background: selectedEquipment === eq ? "#e94560" : "rgba(255,255,255,0.06)",
+                color: selectedEquipment === eq ? "#fff" : "#ccd6f6",
+                transition: "all 0.2s ease"
+              }}>{eq}</button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {searching && (
+        <div style={{ textAlign: "center", padding: 32, color: "#8892b0", fontSize: 13, letterSpacing: 2, animation: "pulse 1.5s infinite" }}>
+          SEARCHING...
+        </div>
+      )}
+      {error && <div style={{ textAlign: "center", padding: 24, color: "#e94560", fontSize: 14 }}>{error}</div>}
+
+      {/* Results */}
+      {results.map((ex, i) => (
+        <div key={ex.id || i} className="fade-in" style={{
+          background: "rgba(255,255,255,0.04)", borderRadius: 14,
+          marginBottom: 12, border: "1px solid rgba(255,255,255,0.06)",
+          overflow: "hidden", animationDelay: `${i * 30}ms`
+        }}>
+          <div onClick={() => setExpanded(expanded === i ? null : i)} style={{
+            display: "flex", alignItems: "center", gap: 14, padding: 14, cursor: "pointer"
+          }}>
+            <ExerciseGif exerciseId={ex.id} size={56} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ color: "#ccd6f6", fontSize: 15, fontWeight: 600, textTransform: "capitalize", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {ex.name}
+              </div>
+              <div style={{ color: "#8892b0", fontSize: 12, marginTop: 3, textTransform: "capitalize" }}>
+                {ex.bodyPart} · {ex.target} · {ex.equipment}
+              </div>
+            </div>
+            {onSelect && (
+              <button onClick={(e) => { e.stopPropagation(); onSelect(ex); }} style={{
+                padding: "8px 14px", background: "rgba(100,255,218,0.15)",
+                border: "1px solid rgba(100,255,218,0.3)", borderRadius: 10,
+                color: "#64ffda", fontSize: 13, fontWeight: 700, cursor: "pointer", flexShrink: 0
+              }}>+ Add</button>
+            )}
+          </div>
+
+          {/* Expanded details */}
+          {expanded === i && (
+            <div style={{ padding: "0 14px 14px", borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+              <div style={{ display: "flex", justifyContent: "center", paddingTop: 14, marginBottom: 14 }}>
+                <ExerciseGif exerciseId={ex.id} size={180} />
+              </div>
+              <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 10 }}>
+                <div style={{ background: "rgba(100,255,218,0.08)", borderRadius: 8, padding: "8px 14px" }}>
+                  <div style={{ color: "#64ffda", fontSize: 10, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase", marginBottom: 2 }}>Target</div>
+                  <div style={{ color: "#ccd6f6", fontSize: 13, textTransform: "capitalize" }}>{ex.target}</div>
+                </div>
+                <div style={{ background: "rgba(255,255,255,0.04)", borderRadius: 8, padding: "8px 14px" }}>
+                  <div style={{ color: "#64ffda", fontSize: 10, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase", marginBottom: 2 }}>Equipment</div>
+                  <div style={{ color: "#ccd6f6", fontSize: 13, textTransform: "capitalize" }}>{ex.equipment}</div>
+                </div>
+                {ex.difficulty && (
+                  <div style={{ background: "rgba(233,69,96,0.08)", borderRadius: 8, padding: "8px 14px" }}>
+                    <div style={{ color: "#e94560", fontSize: 10, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase", marginBottom: 2 }}>Difficulty</div>
+                    <div style={{ color: "#ccd6f6", fontSize: 13, textTransform: "capitalize" }}>{ex.difficulty}</div>
+                  </div>
+                )}
+              </div>
+              {ex.secondaryMuscles?.length > 0 && (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ color: "#8892b0", fontSize: 11, letterSpacing: 1, textTransform: "uppercase", marginBottom: 4 }}>Secondary Muscles</div>
+                  <div style={{ color: "#ccd6f6", fontSize: 13, textTransform: "capitalize" }}>{ex.secondaryMuscles.join(", ")}</div>
+                </div>
+              )}
+              {ex.instructions?.length > 0 && (
+                <div style={{ marginTop: 10 }}>
+                  <div style={{ color: "#64ffda", fontSize: 10, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Instructions</div>
+                  {ex.instructions.map((step, si) => (
+                    <div key={si} style={{ color: "#ccd6f6", fontSize: 13, lineHeight: 1.5, marginBottom: 6, paddingLeft: 16, position: "relative" }}>
+                      <span style={{ position: "absolute", left: 0, color: "#8892b0", fontSize: 12 }}>{si + 1}.</span>
+                      {step}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      ))}
+
+      {!searching && !error && results.length === 0 && (query || selectedPart || selectedEquipment) && (
+        <div style={{ textAlign: "center", padding: 32, color: "#8892b0", fontSize: 14 }}>
+          No exercises found
+        </div>
+      )}
+      {!searching && !query && !selectedPart && !selectedEquipment && results.length === 0 && (
+        <div style={{ textAlign: "center", padding: 32, color: "#8892b0", fontSize: 14, lineHeight: 1.6 }}>
+          Search by name, or select a body part or equipment type
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Builder Home ───
+function BuilderHome({ routines, programs, onNewRoutine, onEditRoutine, onDeleteRoutine, onNewProgram, onEditProgram, onDeleteProgram, onActivateProgram, activeSource, onSearch }) {
+  return (
+    <div style={{ padding: "0 20px 80px" }}>
+      {/* Search shortcut */}
+      <button onClick={onSearch} style={{
+        width: "100%", padding: "16px 20px", background: "rgba(255,255,255,0.04)",
+        border: "2px dashed rgba(255,255,255,0.12)", borderRadius: 14,
+        color: "#8892b0", fontSize: 15, cursor: "pointer", textAlign: "left",
+        marginBottom: 28, display: "flex", alignItems: "center", gap: 10
+      }}>
+        <span style={{ fontSize: 18 }}>🔍</span> Search exercises...
+      </button>
+
+      {/* Routines section */}
+      <div style={{ marginBottom: 32 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <h3 style={{ color: "#ccd6f6", fontSize: 18, fontWeight: 700 }}>My Routines</h3>
+          <button onClick={onNewRoutine} style={{
+            padding: "8px 16px", background: "rgba(100,255,218,0.15)",
+            border: "1px solid rgba(100,255,218,0.3)", borderRadius: 10,
+            color: "#64ffda", fontSize: 13, fontWeight: 700, cursor: "pointer"
+          }}>+ New</button>
+        </div>
+
+        {Object.values(routines).length === 0 ? (
+          <div style={{ padding: 24, textAlign: "center", color: "#8892b0", fontSize: 14, background: "rgba(255,255,255,0.02)", borderRadius: 14, border: "1px solid rgba(255,255,255,0.06)" }}>
+            No routines yet. Create one to get started!
+          </div>
+        ) : (
+          Object.values(routines).map(routine => (
+            <div key={routine.id} className="fade-in" style={{
+              background: "rgba(255,255,255,0.04)", borderRadius: 14,
+              padding: 16, marginBottom: 10, border: "1px solid rgba(255,255,255,0.06)"
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ color: "#ccd6f6", fontSize: 16, fontWeight: 600 }}>{routine.name}</div>
+                  <div style={{ color: "#8892b0", fontSize: 13, marginTop: 4 }}>{routine.exercises.length} exercises</div>
+                  <div style={{ color: "#8892b0", fontSize: 12, marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {routine.exercises.map(e => e.name).join(", ")}
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 8, flexShrink: 0, marginLeft: 12 }}>
+                  <button onClick={() => onEditRoutine(routine.id)} style={{
+                    padding: "8px 12px", background: "rgba(255,255,255,0.06)",
+                    border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8,
+                    color: "#8892b0", fontSize: 12, cursor: "pointer"
+                  }}>Edit</button>
+                  <button onClick={() => { if (confirm(`Delete "${routine.name}"?`)) onDeleteRoutine(routine.id); }} style={{
+                    padding: "8px 12px", background: "rgba(233,69,96,0.1)",
+                    border: "1px solid rgba(233,69,96,0.2)", borderRadius: 8,
+                    color: "#e94560", fontSize: 12, cursor: "pointer"
+                  }}>Del</button>
+                </div>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+
+      {/* Programs section */}
+      <div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <h3 style={{ color: "#ccd6f6", fontSize: 18, fontWeight: 700 }}>My Programs</h3>
+          <button onClick={onNewProgram} style={{
+            padding: "8px 16px", background: "rgba(100,255,218,0.15)",
+            border: "1px solid rgba(100,255,218,0.3)", borderRadius: 10,
+            color: "#64ffda", fontSize: 13, fontWeight: 700, cursor: "pointer"
+          }}>+ New</button>
+        </div>
+
+        {Object.values(programs).length === 0 ? (
+          <div style={{ padding: 24, textAlign: "center", color: "#8892b0", fontSize: 14, background: "rgba(255,255,255,0.02)", borderRadius: 14, border: "1px solid rgba(255,255,255,0.06)" }}>
+            No programs yet. Build routines first, then combine them into a program!
+          </div>
+        ) : (
+          Object.values(programs).map(prog => {
+            const isActive = activeSource?.type === "program" && activeSource?.programId === prog.id;
+            return (
+              <div key={prog.id} className="fade-in" style={{
+                background: isActive ? "rgba(100,255,218,0.06)" : "rgba(255,255,255,0.04)",
+                borderRadius: 14, padding: 16, marginBottom: 10,
+                border: isActive ? "1px solid rgba(100,255,218,0.3)" : "1px solid rgba(255,255,255,0.06)"
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ color: "#ccd6f6", fontSize: 16, fontWeight: 600 }}>{prog.name}</span>
+                      {isActive && <span style={{ padding: "2px 8px", background: "#64ffda", color: "#0a192f", fontSize: 10, fontWeight: 700, borderRadius: 6 }}>ACTIVE</span>}
+                    </div>
+                    <div style={{ color: "#8892b0", fontSize: 13, marginTop: 4 }}>
+                      {prog.weeks.length} week{prog.weeks.length !== 1 ? "s" : ""} · {prog.weeks.reduce((sum, w) => sum + w.days.length, 0)} days
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, flexShrink: 0, marginLeft: 12 }}>
+                    {!isActive && (
+                      <button onClick={() => onActivateProgram(prog.id)} style={{
+                        padding: "8px 12px", background: "rgba(100,255,218,0.15)",
+                        border: "1px solid rgba(100,255,218,0.3)", borderRadius: 8,
+                        color: "#64ffda", fontSize: 12, cursor: "pointer", fontWeight: 700
+                      }}>Start</button>
+                    )}
+                    <button onClick={() => onEditProgram(prog.id)} style={{
+                      padding: "8px 12px", background: "rgba(255,255,255,0.06)",
+                      border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8,
+                      color: "#8892b0", fontSize: 12, cursor: "pointer"
+                    }}>Edit</button>
+                    <button onClick={() => { if (confirm(`Delete "${prog.name}"?`)) onDeleteProgram(prog.id); }} style={{
+                      padding: "8px 12px", background: "rgba(233,69,96,0.1)",
+                      border: "1px solid rgba(233,69,96,0.2)", borderRadius: 8,
+                      color: "#e94560", fontSize: 12, cursor: "pointer"
+                    }}>Del</button>
+                  </div>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Routine Editor ───
+function RoutineEditor({ routine, onSave, onBack }) {
+  const [name, setName] = useState(routine?.name || "");
+  const [exercises, setExercises] = useState(routine?.exercises || []);
+  const [showSearch, setShowSearch] = useState(false);
+
+  const handleAddExercise = (ex) => {
+    setExercises([...exercises, {
+      name: ex.name, sets: 3, reps: "8-12", rest: "2",
+      bodyPart: ex.bodyPart, target: ex.target
+    }]);
+    setShowSearch(false);
+  };
+
+  const updateExercise = (idx, field, value) => {
+    const updated = [...exercises];
+    updated[idx] = { ...updated[idx], [field]: value };
+    setExercises(updated);
+  };
+
+  const removeExercise = (idx) => {
+    setExercises(exercises.filter((_, i) => i !== idx));
+  };
+
+  const moveExercise = (idx, dir) => {
+    const newIdx = idx + dir;
+    if (newIdx < 0 || newIdx >= exercises.length) return;
+    const updated = [...exercises];
+    [updated[idx], updated[newIdx]] = [updated[newIdx], updated[idx]];
+    setExercises(updated);
+  };
+
+  if (showSearch) {
+    return (
+      <div style={{ paddingBottom: 80 }}>
+        <ExerciseSearch onSelect={handleAddExercise} onBack={() => setShowSearch(false)} />
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ padding: "0 20px 80px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 24 }}>
+        <button onClick={onBack} style={{ background: "none", border: "none", color: "#64ffda", fontSize: 15, cursor: "pointer", fontWeight: 600, flexShrink: 0 }}>←</button>
+        <h2 style={{ color: "#ccd6f6", fontSize: 20, fontWeight: 700 }}>{routine ? "Edit Routine" : "New Routine"}</h2>
+      </div>
+
+      {/* Routine name */}
+      <div style={{ marginBottom: 24 }}>
+        <label style={{ display: "block", color: "#8892b0", fontSize: 11, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Routine Name</label>
+        <input type="text" value={name} onChange={e => setName(e.target.value)}
+          placeholder="e.g. Pull Day, Leg Day..."
+          style={{
+            width: "100%", padding: "14px 16px", background: "rgba(255,255,255,0.06)",
+            border: "2px solid rgba(255,255,255,0.12)", borderRadius: 12,
+            color: "#ccd6f6", fontSize: 16, outline: "none", boxSizing: "border-box"
+          }}
+        />
+      </div>
+
+      {/* Exercise list */}
+      {exercises.map((ex, i) => (
+        <div key={i} className="fade-in" style={{
+          background: "rgba(255,255,255,0.04)", borderRadius: 14,
+          padding: 14, marginBottom: 10, border: "1px solid rgba(255,255,255,0.06)"
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ color: "#ccd6f6", fontSize: 15, fontWeight: 600, textTransform: "capitalize", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ex.name}</div>
+              {ex.bodyPart && <div style={{ color: "#8892b0", fontSize: 11, textTransform: "capitalize", marginTop: 2 }}>{ex.bodyPart} · {ex.target}</div>}
+            </div>
+            <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+              <button onClick={() => moveExercise(i, -1)} disabled={i === 0} style={{ width: 28, height: 28, borderRadius: 6, background: "rgba(255,255,255,0.06)", border: "none", color: i === 0 ? "#333" : "#8892b0", cursor: i === 0 ? "default" : "pointer", fontSize: 12 }}>↑</button>
+              <button onClick={() => moveExercise(i, 1)} disabled={i === exercises.length - 1} style={{ width: 28, height: 28, borderRadius: 6, background: "rgba(255,255,255,0.06)", border: "none", color: i === exercises.length - 1 ? "#333" : "#8892b0", cursor: i === exercises.length - 1 ? "default" : "pointer", fontSize: 12 }}>↓</button>
+              <button onClick={() => removeExercise(i)} style={{ width: 28, height: 28, borderRadius: 6, background: "rgba(233,69,96,0.1)", border: "none", color: "#e94560", cursor: "pointer", fontSize: 12 }}>✕</button>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <div style={{ flex: 1 }}>
+              <label style={{ display: "block", color: "#8892b0", fontSize: 10, letterSpacing: 1, textTransform: "uppercase", marginBottom: 4 }}>Sets</label>
+              <input type="number" inputMode="numeric" value={ex.sets} onChange={e => updateExercise(i, "sets", parseInt(e.target.value) || 1)}
+                style={{ width: "100%", padding: "10px 8px", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, color: "#ccd6f6", fontSize: 16, textAlign: "center", outline: "none", fontFamily: "'JetBrains Mono',monospace" }} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={{ display: "block", color: "#8892b0", fontSize: 10, letterSpacing: 1, textTransform: "uppercase", marginBottom: 4 }}>Reps</label>
+              <input type="text" value={ex.reps} onChange={e => updateExercise(i, "reps", e.target.value)}
+                placeholder="8-12"
+                style={{ width: "100%", padding: "10px 8px", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, color: "#ccd6f6", fontSize: 16, textAlign: "center", outline: "none", fontFamily: "'JetBrains Mono',monospace" }} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={{ display: "block", color: "#8892b0", fontSize: 10, letterSpacing: 1, textTransform: "uppercase", marginBottom: 4 }}>Rest (min)</label>
+              <input type="text" value={ex.rest} onChange={e => updateExercise(i, "rest", e.target.value)}
+                placeholder="2"
+                style={{ width: "100%", padding: "10px 8px", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, color: "#ccd6f6", fontSize: 16, textAlign: "center", outline: "none", fontFamily: "'JetBrains Mono',monospace" }} />
+            </div>
+          </div>
+        </div>
+      ))}
+
+      {/* Add exercise button */}
+      <button onClick={() => setShowSearch(true)} style={{
+        width: "100%", padding: 16, background: "rgba(255,255,255,0.04)",
+        border: "2px dashed rgba(100,255,218,0.3)", borderRadius: 14,
+        color: "#64ffda", fontSize: 15, fontWeight: 600, cursor: "pointer",
+        marginBottom: 20
+      }}>+ Add Exercise</button>
+
+      {/* Save button */}
+      <button onClick={() => {
+        if (!name.trim()) { alert("Please enter a routine name"); return; }
+        if (exercises.length === 0) { alert("Add at least one exercise"); return; }
+        onSave({ ...routine, name: name.trim(), exercises });
+      }} style={{
+        width: "100%", padding: 18, background: exercises.length > 0 && name.trim() ? "#64ffda" : "rgba(100,255,218,0.3)",
+        border: "none", borderRadius: 14, color: "#0a192f", fontSize: 17, fontWeight: 700,
+        cursor: exercises.length > 0 && name.trim() ? "pointer" : "default", letterSpacing: 1
+      }}>Save Routine</button>
+    </div>
+  );
+}
+
+// ─── Program Editor ───
+function ProgramEditor({ program, routines, onSave, onBack }) {
+  const [name, setName] = useState(program?.name || "");
+  const [weeks, setWeeks] = useState(program?.weeks || [{ name: "WEEK 1", days: [] }]);
+
+  const addWeek = () => {
+    setWeeks([...weeks, { name: `WEEK ${weeks.length + 1}`, days: [] }]);
+  };
+
+  const removeWeek = (idx) => {
+    if (weeks.length <= 1) return;
+    setWeeks(weeks.filter((_, i) => i !== idx));
+  };
+
+  const updateWeekName = (idx, newName) => {
+    const updated = [...weeks];
+    updated[idx] = { ...updated[idx], name: newName };
+    setWeeks(updated);
+  };
+
+  const addDayToWeek = (weekIdx, routineId) => {
+    const routine = routines[routineId];
+    if (!routine) return;
+    const updated = [...weeks];
+    updated[weekIdx] = {
+      ...updated[weekIdx],
+      days: [...updated[weekIdx].days, { routineId, routineName: routine.name }]
+    };
+    setWeeks(updated);
+  };
+
+  const removeDayFromWeek = (weekIdx, dayIdx) => {
+    const updated = [...weeks];
+    updated[weekIdx] = {
+      ...updated[weekIdx],
+      days: updated[weekIdx].days.filter((_, i) => i !== dayIdx)
+    };
+    setWeeks(updated);
+  };
+
+  const routineList = Object.values(routines);
+
+  return (
+    <div style={{ padding: "0 20px 80px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 24 }}>
+        <button onClick={onBack} style={{ background: "none", border: "none", color: "#64ffda", fontSize: 15, cursor: "pointer", fontWeight: 600, flexShrink: 0 }}>←</button>
+        <h2 style={{ color: "#ccd6f6", fontSize: 20, fontWeight: 700 }}>{program ? "Edit Program" : "New Program"}</h2>
+      </div>
+
+      {/* Program name */}
+      <div style={{ marginBottom: 24 }}>
+        <label style={{ display: "block", color: "#8892b0", fontSize: 11, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Program Name</label>
+        <input type="text" value={name} onChange={e => setName(e.target.value)}
+          placeholder="e.g. 8 Week Strength Program..."
+          style={{
+            width: "100%", padding: "14px 16px", background: "rgba(255,255,255,0.06)",
+            border: "2px solid rgba(255,255,255,0.12)", borderRadius: 12,
+            color: "#ccd6f6", fontSize: 16, outline: "none", boxSizing: "border-box"
+          }}
+        />
+      </div>
+
+      {routineList.length === 0 && (
+        <div style={{ padding: 24, textAlign: "center", color: "#e94560", fontSize: 14, background: "rgba(233,69,96,0.08)", borderRadius: 14, border: "1px solid rgba(233,69,96,0.2)", marginBottom: 20 }}>
+          Create some routines first before building a program!
+        </div>
+      )}
+
+      {/* Weeks */}
+      {weeks.map((week, wi) => (
+        <div key={wi} style={{
+          background: "rgba(255,255,255,0.04)", borderRadius: 14,
+          padding: 16, marginBottom: 14, border: "1px solid rgba(255,255,255,0.06)"
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <input type="text" value={week.name} onChange={e => updateWeekName(wi, e.target.value)}
+              style={{
+                background: "transparent", border: "none", color: "#64ffda", fontSize: 15,
+                fontWeight: 700, outline: "none", letterSpacing: 1
+              }}
+            />
+            {weeks.length > 1 && (
+              <button onClick={() => removeWeek(wi)} style={{ padding: "4px 10px", background: "rgba(233,69,96,0.1)", border: "none", borderRadius: 6, color: "#e94560", fontSize: 11, cursor: "pointer" }}>Remove</button>
+            )}
+          </div>
+
+          {/* Days in this week */}
+          {week.days.map((day, di) => (
+            <div key={di} style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              padding: "10px 12px", background: "rgba(255,255,255,0.04)", borderRadius: 10,
+              marginBottom: 6, border: "1px solid rgba(255,255,255,0.06)"
+            }}>
+              <div>
+                <span style={{ color: "#8892b0", fontSize: 12, marginRight: 8 }}>Day {di + 1}</span>
+                <span style={{ color: "#ccd6f6", fontSize: 14, fontWeight: 600 }}>{day.routineName}</span>
+              </div>
+              <button onClick={() => removeDayFromWeek(wi, di)} style={{
+                width: 24, height: 24, borderRadius: 6, background: "rgba(233,69,96,0.1)",
+                border: "none", color: "#e94560", cursor: "pointer", fontSize: 11
+              }}>✕</button>
+            </div>
+          ))}
+
+          {/* Add day to week */}
+          {routineList.length > 0 && (
+            <select onChange={e => { if (e.target.value) { addDayToWeek(wi, e.target.value); e.target.value = ""; } }} defaultValue=""
+              style={{
+                width: "100%", padding: "10px 12px", background: "rgba(255,255,255,0.04)",
+                border: "1px dashed rgba(100,255,218,0.3)", borderRadius: 10,
+                color: "#64ffda", fontSize: 13, cursor: "pointer", outline: "none", marginTop: 4
+              }}>
+              <option value="" disabled>+ Add routine to this week...</option>
+              {routineList.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+            </select>
+          )}
+        </div>
+      ))}
+
+      {/* Add week */}
+      <button onClick={addWeek} style={{
+        width: "100%", padding: 14, background: "rgba(255,255,255,0.04)",
+        border: "2px dashed rgba(255,255,255,0.12)", borderRadius: 14,
+        color: "#8892b0", fontSize: 14, fontWeight: 600, cursor: "pointer", marginBottom: 20
+      }}>+ Add Week</button>
+
+      {/* Save */}
+      <button onClick={() => {
+        if (!name.trim()) { alert("Please enter a program name"); return; }
+        if (weeks.every(w => w.days.length === 0)) { alert("Add at least one day to a week"); return; }
+        onSave({ ...program, name: name.trim(), weeks });
+      }} style={{
+        width: "100%", padding: 18,
+        background: name.trim() && weeks.some(w => w.days.length > 0) ? "#64ffda" : "rgba(100,255,218,0.3)",
+        border: "none", borderRadius: 14, color: "#0a192f", fontSize: 17, fontWeight: 700,
+        cursor: name.trim() && weeks.some(w => w.days.length > 0) ? "pointer" : "default", letterSpacing: 1
+      }}>Save Program</button>
+    </div>
+  );
+}
+
 // ══════════════════════════════════════════
 //  Main App
 // ══════════════════════════════════════════
@@ -518,13 +1212,73 @@ function App() {
   const [view, setView] = useState("workout"); // workout | overview
   const [editingSet, setEditingSet] = useState(null); // index of set being edited, or null
 
+  // Builder state
+  const [tab, setTab] = useState("workout"); // workout | build
+  const [buildView, setBuildView] = useState("home"); // home | search | editRoutine | editProgram
+  const [routines, setRoutines] = useState({}); // { id: { id, name, exercises } }
+  const [programs, setPrograms] = useState({}); // { id: { id, name, weeks } }
+  const [activeSource, setActiveSource] = useState({ type: "sheets" });
+  const [activeWeeks, setActiveWeeks] = useState(WEEKS);
+  const [editingRoutineId, setEditingRoutineId] = useState(null);
+  const [editingProgramId, setEditingProgramId] = useState(null);
+
+  const saveRoutines = useCallback(async (r) => { setRoutines(r); await dbSet("routines", r); }, []);
+  const savePrograms = useCallback(async (p) => { setPrograms(p); await dbSet("programs", p); }, []);
+  const saveActiveSource = useCallback(async (s) => { setActiveSource(s); await dbSet("activeSource", s); }, []);
+
+  function resolveProgram(program, rts) {
+    const resolved = {};
+    program.weeks.forEach((week, i) => {
+      const weekName = week.name || `WEEK ${i + 1}`;
+      resolved[weekName] = week.days.map(day => {
+        const routine = rts[day.routineId];
+        if (!routine) return { name: day.routineName || "Unknown", exercises: [] };
+        return { name: routine.name, exercises: routine.exercises.map(ex => ({
+          name: ex.name, sets: ex.sets || 3, reps: ex.reps || "8-12", rest: ex.rest || "2"
+        }))};
+      });
+    });
+    return resolved;
+  }
+
+  async function activateProgram(progId) {
+    const prog = programs[progId];
+    if (!prog) return;
+    const resolved = resolveProgram(prog, routines);
+    const weekNames = Object.keys(resolved);
+    setPlan(resolved);
+    setActiveWeeks(weekNames);
+    setWeekIdx(0); setDayIdx(0); setExIdx(0);
+    setStarted(false); setComplete(false);
+    await saveActiveSource({ type: "program", programId: progId });
+    await save(0, 0, defTimer);
+    setTab("workout");
+  }
+
+  async function activateSheets() {
+    try {
+      const freshPlan = await fetchAllWeeks();
+      setPlan(freshPlan);
+      await dbSet("plan", freshPlan);
+    } catch (e) {
+      const cached = await dbGet("plan");
+      if (cached) setPlan(cached);
+    }
+    setActiveWeeks(WEEKS);
+    setWeekIdx(0); setDayIdx(0); setExIdx(0);
+    setStarted(false); setComplete(false);
+    await saveActiveSource({ type: "sheets" });
+    await save(0, 0, defTimer);
+  }
+
   // ─── Init: load from IDB, then fetch plan ───
   useEffect(() => {
     (async () => {
       try {
         // Load saved state
-        const [savedState, savedLogged, savedHistory, savedPlan] = await Promise.all([
-          dbGet("state"), dbGet("logged"), dbGet("history"), dbGet("plan")
+        const [savedState, savedLogged, savedHistory, savedPlan, savedRoutines, savedPrograms, savedSource] = await Promise.all([
+          dbGet("state"), dbGet("logged"), dbGet("history"), dbGet("plan"),
+          dbGet("routines"), dbGet("programs"), dbGet("activeSource")
         ]);
         if (savedState) {
           setWeekIdx(savedState.weekIdx ?? 0);
@@ -533,18 +1287,29 @@ function App() {
         }
         if (savedLogged) setLogged(savedLogged);
         if (savedHistory) setHistory(savedHistory);
+        if (savedRoutines) setRoutines(savedRoutines);
+        if (savedPrograms) setPrograms(savedPrograms);
+        if (savedSource) setActiveSource(savedSource);
 
-        // Try fetching fresh plan from sheet
-        try {
-          const freshPlan = await fetchAllWeeks();
-          setPlan(freshPlan);
-          await dbSet("plan", freshPlan);
-        } catch (e) {
-          // Offline - use cached plan
-          if (savedPlan) {
-            setPlan(savedPlan);
-          } else {
-            throw new Error("No cached data and can't reach Google Sheets. Please connect to the internet for initial setup.");
+        // Load plan based on active source
+        const src = savedSource || { type: "sheets" };
+        if (src.type === "program" && savedPrograms && savedRoutines && savedPrograms[src.programId]) {
+          const resolved = resolveProgram(savedPrograms[src.programId], savedRoutines);
+          setPlan(resolved);
+          setActiveWeeks(Object.keys(resolved));
+        } else {
+          // Try fetching fresh plan from sheet
+          try {
+            const freshPlan = await fetchAllWeeks();
+            setPlan(freshPlan);
+            await dbSet("plan", freshPlan);
+          } catch (e) {
+            // Offline - use cached plan
+            if (savedPlan) {
+              setPlan(savedPlan);
+            } else {
+              throw new Error("No cached data and can't reach Google Sheets. Please connect to the internet for initial setup.");
+            }
           }
         }
         setLoading(false);
@@ -563,7 +1328,7 @@ function App() {
   const saveLogs = useCallback(async (l) => { setLogged(l); await dbSet("logged", l); }, []);
   const saveHist = useCallback(async (h) => { setHistory(h); await dbSet("history", h); }, []);
 
-  const curWeek = plan ? plan[WEEKS[weekIdx]] : null;
+  const curWeek = plan ? plan[activeWeeks[weekIdx]] : null;
   const curDay = curWeek?.[dayIdx];
   const curEx = curDay?.exercises[exIdx];
   const logKey = (w, d, name) => `W${w}|D${d}|${name}`;
@@ -622,7 +1387,7 @@ function App() {
       const sets = logged[k] || [];
       if (sets.length > 0) {
         if (!newHist[ex.name]) newHist[ex.name] = [];
-        newHist[ex.name].push({ week: WEEKS[weekIdx], day: dayIdx, sets: [...sets] });
+        newHist[ex.name].push({ week: activeWeeks[weekIdx], day: dayIdx, sets: [...sets] });
       }
     }
     await saveHist(newHist);
@@ -636,7 +1401,7 @@ function App() {
 
     // Advance day
     let nw = weekIdx, nd = dayIdx + 1;
-    if (nd >= curWeek.length) { nd = 0; nw = Math.min(weekIdx + 1, WEEKS.length - 1); }
+    if (nd >= curWeek.length) { nd = 0; nw = Math.min(weekIdx + 1, activeWeeks.length - 1); }
     setWeekIdx(nw); setDayIdx(nd); setExIdx(0);
     setComplete(false); setStarted(false);
     await save(nw, nd, defTimer);
@@ -644,7 +1409,7 @@ function App() {
 
   const skipDay = async () => {
     let nw = weekIdx, nd = dayIdx + 1;
-    if (nd >= curWeek.length) { nd = 0; nw = Math.min(weekIdx + 1, WEEKS.length - 1); }
+    if (nd >= curWeek.length) { nd = 0; nw = Math.min(weekIdx + 1, activeWeeks.length - 1); }
     setWeekIdx(nw); setDayIdx(nd); setExIdx(0);
     setComplete(false); setStarted(false); setTimer(false);
     await save(nw, nd, defTimer);
@@ -673,8 +1438,73 @@ function App() {
 
   const cs = {
     minHeight: "100dvh", background: "#0a192f", color: "#ccd6f6",
-    maxWidth: 480, margin: "0 auto", paddingBottom: 60
+    maxWidth: 480, margin: "0 auto", paddingBottom: 80
   };
+
+  // ─── Build Tab ───
+  if (tab === "build") return (
+    <div style={cs}>
+      <div style={{ padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+        <div style={{ color: "#64ffda", fontSize: 11, letterSpacing: 2, textTransform: "uppercase", fontWeight: 700 }}>
+          {buildView === "home" ? "Workout Builder" : buildView === "search" ? "Exercise Search" : buildView === "editRoutine" ? "Routine Editor" : "Program Editor"}
+        </div>
+        {activeSource.type === "program" && buildView === "home" && (
+          <button onClick={activateSheets} style={{
+            padding: "6px 12px", background: "rgba(255,255,255,0.06)",
+            border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8,
+            color: "#8892b0", fontSize: 11, cursor: "pointer"
+          }}>Use Sheet Plan</button>
+        )}
+      </div>
+
+      <div style={{ padding: "20px 0 0" }}>
+        {buildView === "home" && (
+          <BuilderHome
+            routines={routines} programs={programs} activeSource={activeSource}
+            onSearch={() => setBuildView("search")}
+            onNewRoutine={() => { setEditingRoutineId(null); setBuildView("editRoutine"); }}
+            onEditRoutine={(id) => { setEditingRoutineId(id); setBuildView("editRoutine"); }}
+            onDeleteRoutine={async (id) => { const r = { ...routines }; delete r[id]; await saveRoutines(r); }}
+            onNewProgram={() => { setEditingProgramId(null); setBuildView("editProgram"); }}
+            onEditProgram={(id) => { setEditingProgramId(id); setBuildView("editProgram"); }}
+            onDeleteProgram={async (id) => {
+              const p = { ...programs }; delete p[id]; await savePrograms(p);
+              if (activeSource.type === "program" && activeSource.programId === id) await activateSheets();
+            }}
+            onActivateProgram={activateProgram}
+          />
+        )}
+        {buildView === "search" && (
+          <ExerciseSearch onBack={() => setBuildView("home")} />
+        )}
+        {buildView === "editRoutine" && (
+          <RoutineEditor
+            routine={editingRoutineId ? routines[editingRoutineId] : null}
+            onSave={async (routine) => {
+              const id = routine.id || Date.now().toString();
+              const r = { ...routines, [id]: { ...routine, id } };
+              await saveRoutines(r); setBuildView("home");
+            }}
+            onBack={() => setBuildView("home")}
+          />
+        )}
+        {buildView === "editProgram" && (
+          <ProgramEditor
+            program={editingProgramId ? programs[editingProgramId] : null}
+            routines={routines}
+            onSave={async (program) => {
+              const id = program.id || Date.now().toString();
+              const p = { ...programs, [id]: { ...program, id } };
+              await savePrograms(p); setBuildView("home");
+            }}
+            onBack={() => setBuildView("home")}
+          />
+        )}
+      </div>
+
+      <BottomNav tab={tab} onTabChange={setTab} />
+    </div>
+  );
 
   // ─── Settings ───
   if (settings) return (
@@ -695,7 +1525,7 @@ function App() {
           <label style={{ display: "block", color: "#8892b0", fontSize: 12, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Current Week</label>
           <select value={weekIdx} onChange={e => { const i = parseInt(e.target.value); setWeekIdx(i); setDayIdx(0); setExIdx(0); setStarted(false); setComplete(false); save(i, 0, defTimer); }}
             style={{ width: "100%", padding: 14, background: "rgba(255,255,255,0.06)", border: "2px solid rgba(255,255,255,0.12)", borderRadius: 12, color: "#ccd6f6", fontSize: 16, outline: "none" }}>
-            {WEEKS.map((w, i) => <option key={w} value={i}>{w}</option>)}
+            {activeWeeks.map((w, i) => <option key={w} value={i}>{w}</option>)}
           </select>
         </div>
 
@@ -729,7 +1559,7 @@ function App() {
     <div style={cs}>
       <div style={{ padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
         <button onClick={() => setView("workout")} style={{ background: "none", border: "none", color: "#64ffda", fontSize: 15, cursor: "pointer", fontWeight: 600 }}>← Back</button>
-        <span style={{ color: "#8892b0", fontSize: 13 }}>{WEEKS[weekIdx]}</span>
+        <span style={{ color: "#8892b0", fontSize: 13 }}>{activeWeeks[weekIdx]}</span>
       </div>
       <div style={{ padding: 20 }}>
         <h2 style={{ color: "#ccd6f6", fontSize: 21, fontWeight: 700, marginBottom: 20 }}>{curDay?.name}</h2>
@@ -756,6 +1586,7 @@ function App() {
           );
         })}
       </div>
+      <BottomNav tab={tab} onTabChange={setTab} />
     </div>
   );
 
@@ -765,7 +1596,7 @@ function App() {
       <div className="fade-in" style={{ padding: "50px 24px", textAlign: "center" }}>
         <div style={{ fontSize: 64, marginBottom: 16 }}>💪</div>
         <h2 style={{ color: "#64ffda", fontSize: 24, fontWeight: 700, marginBottom: 8 }}>Workout Complete!</h2>
-        <p style={{ color: "#8892b0", fontSize: 14, marginBottom: 28 }}>{curDay?.name} — {WEEKS[weekIdx]}</p>
+        <p style={{ color: "#8892b0", fontSize: 14, marginBottom: 28 }}>{curDay?.name} — {activeWeeks[weekIdx]}</p>
         <div style={{ background: "rgba(255,255,255,0.04)", borderRadius: 16, padding: 20, textAlign: "left", marginBottom: 28 }}>
           {curDay?.exercises.map((ex, i) => {
             const logs = logged[logKey(weekIdx, dayIdx, ex.name)] || [];
@@ -784,6 +1615,7 @@ function App() {
           Review Exercises
         </button>
       </div>
+      <BottomNav tab={tab} onTabChange={setTab} />
     </div>
   );
 
@@ -791,13 +1623,15 @@ function App() {
   if (!started) return (
     <div style={cs}>
       <div style={{ padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
-        <div style={{ color: "#64ffda", fontSize: 11, letterSpacing: 2, textTransform: "uppercase", fontWeight: 700 }}>Hybrid PPL</div>
+        <div style={{ color: "#64ffda", fontSize: 11, letterSpacing: 2, textTransform: "uppercase", fontWeight: 700 }}>
+          {activeSource.type === "program" && programs[activeSource.programId] ? programs[activeSource.programId].name : "Hybrid PPL"}
+        </div>
         <button onClick={() => setSettings(true)} style={{ background: "rgba(255,255,255,0.06)", border: "none", borderRadius: 8, padding: "8px 14px", color: "#8892b0", cursor: "pointer", fontSize: 16 }}>⚙️</button>
       </div>
       <div style={{ padding: "28px 20px" }}>
         {/* Week pills */}
         <div style={{ display: "flex", gap: 6, marginBottom: 24, flexWrap: "wrap" }}>
-          {WEEKS.map((w, i) => (
+          {activeWeeks.map((w, i) => (
             <div key={w} style={{
               padding: "6px 12px", borderRadius: 20, fontSize: 11, fontWeight: 700, letterSpacing: 1,
               background: i === weekIdx ? "#64ffda" : "rgba(255,255,255,0.06)",
@@ -817,7 +1651,7 @@ function App() {
         }}>
           <div style={{ color: "#8892b0", fontSize: 12, letterSpacing: 2, textTransform: "uppercase", marginBottom: 8 }}>Up Next</div>
           <h1 style={{ color: "#ccd6f6", fontSize: 26, fontWeight: 800, marginBottom: 4, lineHeight: 1.2 }}>{curDay?.name}</h1>
-          <div style={{ color: "#8892b0", fontSize: 14, marginBottom: 20 }}>{curDay?.exercises.length} exercises · {WEEKS[weekIdx]}</div>
+          <div style={{ color: "#8892b0", fontSize: 14, marginBottom: 20 }}>{curDay?.exercises.length} exercises · {activeWeeks[weekIdx]}</div>
 
           {curDay?.exercises.map((ex, i) => (
             <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "9px 0", borderBottom: i < curDay.exercises.length - 1 ? "1px solid rgba(255,255,255,0.06)" : "none" }}>
@@ -836,6 +1670,7 @@ function App() {
           Skip This Day →
         </button>
       </div>
+      <BottomNav tab={tab} onTabChange={setTab} />
     </div>
   );
 
@@ -968,6 +1803,7 @@ function App() {
           </div>
         )}
       </div>
+      <BottomNav tab={tab} onTabChange={setTab} />
     </div>
   );
 }

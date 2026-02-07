@@ -1,4 +1,4 @@
-const CACHE_NAME = 'workout-v2';
+const CACHE_NAME = 'workout-v3';
 const ASSETS = [
   './',
   './index.html',
@@ -40,6 +40,20 @@ self.addEventListener('fetch', (e) => {
 
   // For Google Sheets API calls - network first, fall back to cache
   if (url.hostname === 'docs.google.com') {
+    e.respondWith(
+      fetch(e.request)
+        .then(resp => {
+          const clone = resp.clone();
+          caches.open(CACHE_NAME).then(cache => cache.put(e.request, clone));
+          return resp;
+        })
+        .catch(() => caches.match(e.request))
+    );
+    return;
+  }
+
+  // For ExerciseDB API calls - network first, cache for offline
+  if (url.hostname === 'exercisedb.p.rapidapi.com') {
     e.respondWith(
       fetch(e.request)
         .then(resp => {

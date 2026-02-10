@@ -142,6 +142,7 @@ async function fetchAllWeeks() {
 // Transform wger exercise to ExerciseDB-compatible format
 function transformExercise(wgerEx) {
   const trans = wgerEx.translations?.find(t => t.language === WGER_LANGUAGE) || wgerEx.translations?.[0] || {};
+  const mainVideo = wgerEx.videos?.find(v => v.is_main) || wgerEx.videos?.[0];
   return {
     id: wgerEx.id,
     name: trans.name || "Unknown Exercise",
@@ -150,6 +151,8 @@ function transformExercise(wgerEx) {
     target: wgerEx.muscles?.[0]?.name_en || wgerEx.muscles?.[0]?.name || wgerEx.category?.name || "general",
     equipment: wgerEx.equipment?.[0]?.name?.toLowerCase() || "body weight",
     imageUrl: wgerEx.images?.find(img => img.is_main)?.image || wgerEx.images?.[0]?.image,
+    videoUrl: mainVideo?.video,
+    hasVideo: !!mainVideo,
     muscles: wgerEx.muscles?.map(m => m.name) || [],
     musclesSecondary: wgerEx.muscles_secondary?.map(m => m.name) || []
   };
@@ -624,14 +627,23 @@ function BottomNav({ tab, onTabChange }) {
 }
 
 // ─── Exercise Image (wger.de static images) ───
-function ExerciseImage({ imageUrl, size }) {
+function ExerciseImage({ imageUrl, size, hasVideo }) {
   const s = size || 56;
   if (!imageUrl) return (
     <div style={{ width: s, height: s, borderRadius: 10, flexShrink: 0, background: "rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "center", color: "#64ffda", fontSize: 20 }}>
       💪
     </div>
   );
-  return <img src={imageUrl} alt="" style={{ width: s, height: s, borderRadius: 10, objectFit: "cover", background: "rgba(255,255,255,0.06)", flexShrink: 0 }} onError={(e) => e.target.style.display = 'none'} />;
+  return (
+    <div style={{ position: "relative", width: s, height: s, flexShrink: 0 }}>
+      <img src={imageUrl} alt="" style={{ width: s, height: s, borderRadius: 10, objectFit: "cover", background: "rgba(255,255,255,0.06)" }} onError={(e) => e.target.style.display = 'none'} />
+      {hasVideo && (
+        <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)", background: "rgba(100,255,218,0.9)", borderRadius: "50%", width: s * 0.35, height: s * 0.35, display: "flex", alignItems: "center", justifyContent: "center", color: "#0a192f", fontSize: s * 0.2, fontWeight: "bold", pointerEvents: "none" }}>
+          ▶
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ─── Exercise Search ───
@@ -644,6 +656,7 @@ function ExerciseSearch({ onSelect, onBack }) {
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState(null);
   const [expanded, setExpanded] = useState(null);
+  const [playingVideo, setPlayingVideo] = useState(null);
   const [equipmentList, setEquipmentList] = useState([]);
   const searchTimer = useRef(null);
 
@@ -793,7 +806,7 @@ function ExerciseSearch({ onSelect, onBack }) {
           <div onClick={() => setExpanded(expanded === i ? null : i)} style={{
             display: "flex", alignItems: "center", gap: 14, padding: 14, cursor: "pointer"
           }}>
-            <ExerciseImage imageUrl={ex.imageUrl} size={56} />
+            <ExerciseImage imageUrl={ex.imageUrl} size={56} hasVideo={ex.hasVideo} />
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ color: "#ccd6f6", fontSize: 15, fontWeight: 600, textTransform: "capitalize", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {ex.name}
@@ -815,7 +828,19 @@ function ExerciseSearch({ onSelect, onBack }) {
           {expanded === i && (
             <div style={{ padding: "0 14px 14px", borderTop: "1px solid rgba(255,255,255,0.06)" }}>
               <div style={{ display: "flex", justifyContent: "center", paddingTop: 14, marginBottom: 14 }}>
-                <ExerciseImage imageUrl={ex.imageUrl} size={180} />
+                {ex.hasVideo && playingVideo === i ? (
+                  <video
+                    src={ex.videoUrl}
+                    controls
+                    autoPlay
+                    style={{ width: "100%", maxWidth: 320, borderRadius: 10, background: "#000" }}
+                    onEnded={() => setPlayingVideo(null)}
+                  />
+                ) : (
+                  <div onClick={() => ex.hasVideo && setPlayingVideo(i)} style={{ cursor: ex.hasVideo ? "pointer" : "default" }}>
+                    <ExerciseImage imageUrl={ex.imageUrl} size={180} hasVideo={ex.hasVideo} />
+                  </div>
+                )}
               </div>
               <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 10 }}>
                 <div style={{ background: "rgba(100,255,218,0.08)", borderRadius: 8, padding: "8px 14px" }}>

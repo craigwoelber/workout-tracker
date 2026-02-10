@@ -41,10 +41,9 @@ const WEEKS = ["WEEK 1","WEEK 2","WEEK 3","WEEK 4","WEEK 5","WEEK 6","WEEK 7","W
 const DB_NAME = "WorkoutTrackerDB";
 const DB_VERSION = 1;
 
-// ExerciseDB API
-const EXERCISEDB_HOST = "exercisedb.p.rapidapi.com";
-const EXERCISEDB_KEY = "6053294d2cmsh784416a9d0bf043p1c1eecjsn4b4efb735ed8";
-const EXERCISEDB_HEADERS = { "X-RapidAPI-Key": EXERCISEDB_KEY, "X-RapidAPI-Host": EXERCISEDB_HOST };
+// Wger.de API
+const WGER_BASE_URL = "https://wger.de/api/v2";
+const WGER_LANGUAGE = 2; // English
 
 // ══════════════════════════════════════════
 //  IndexedDB
@@ -127,49 +126,71 @@ async function fetchAllWeeks() {
 }
 
 // ══════════════════════════════════════════
-//  ExerciseDB API
+//  Wger.de API
 // ══════════════════════════════════════════
+
+// Transform wger exercise to ExerciseDB-compatible format
+function transformExercise(wgerEx) {
+  const trans = wgerEx.translations?.find(t => t.language === WGER_LANGUAGE) || wgerEx.translations?.[0] || {};
+  return {
+    id: wgerEx.id,
+    name: trans.name || "Unknown Exercise",
+    bodyPart: wgerEx.category?.name?.toLowerCase() || "general",
+    target: wgerEx.muscles?.[0]?.name_en || wgerEx.muscles?.[0]?.name || wgerEx.category?.name || "general",
+    equipment: wgerEx.equipment?.[0]?.name?.toLowerCase() || "body weight",
+    imageUrl: wgerEx.images?.find(img => img.is_main)?.image || wgerEx.images?.[0]?.image,
+    muscles: wgerEx.muscles?.map(m => m.name) || [],
+    musclesSecondary: wgerEx.muscles_secondary?.map(m => m.name) || []
+  };
+}
+
 async function searchExercises(query) {
   const resp = await fetch(
-    `https://${EXERCISEDB_HOST}/exercises/name/${encodeURIComponent(query.toLowerCase())}?limit=100&offset=0`,
-    { headers: EXERCISEDB_HEADERS }
+    `${WGER_BASE_URL}/exerciseinfo/?language=${WGER_LANGUAGE}&limit=100&offset=0`
   );
   if (!resp.ok) throw new Error("API request failed");
-  return resp.json();
+  const data = await resp.json();
+  const q = query.toLowerCase();
+  const filtered = data.results.filter(ex =>
+    ex.translations?.some(t => t.name?.toLowerCase().includes(q))
+  );
+  return filtered.map(transformExercise);
 }
 
 async function fetchBodyPartList() {
-  const resp = await fetch(`https://${EXERCISEDB_HOST}/exercises/bodyPartList`, { headers: EXERCISEDB_HEADERS });
+  const resp = await fetch(`${WGER_BASE_URL}/exercisecategory/`);
   if (!resp.ok) throw new Error("API request failed");
-  return resp.json();
+  const data = await resp.json();
+  return data.results; // Returns [{id: 11, name: "Chest"}, ...]
 }
 
-async function fetchByBodyPart(bodyPart) {
+async function fetchByBodyPart(categoryId) {
   const resp = await fetch(
-    `https://${EXERCISEDB_HOST}/exercises/bodyPart/${encodeURIComponent(bodyPart)}?limit=100&offset=0`,
-    { headers: EXERCISEDB_HEADERS }
+    `${WGER_BASE_URL}/exerciseinfo/?language=${WGER_LANGUAGE}&category=${categoryId}&limit=100&offset=0`
   );
   if (!resp.ok) throw new Error("API request failed");
-  return resp.json();
+  const data = await resp.json();
+  return data.results.map(transformExercise);
 }
 
-async function fetchByEquipment(equipment) {
+async function fetchByEquipment(equipmentId) {
   const resp = await fetch(
-    `https://${EXERCISEDB_HOST}/exercises/equipment/${encodeURIComponent(equipment)}?limit=100&offset=0`,
-    { headers: EXERCISEDB_HEADERS }
+    `${WGER_BASE_URL}/exerciseinfo/?language=${WGER_LANGUAGE}&equipment=${equipmentId}&limit=100&offset=0`
   );
   if (!resp.ok) throw new Error("API request failed");
-  return resp.json();
+  const data = await resp.json();
+  return data.results.map(transformExercise);
 }
 
 async function fetchEquipmentList() {
-  const resp = await fetch(`https://${EXERCISEDB_HOST}/exercises/equipmentList`, { headers: EXERCISEDB_HEADERS });
+  const resp = await fetch(`${WGER_BASE_URL}/equipment/`);
   if (!resp.ok) throw new Error("API request failed");
-  return resp.json();
+  const data = await resp.json();
+  return data.results; // Returns [{id: 3, name: "Dumbbell"}, ...]
 }
 
-function exerciseImageUrl(id) {
-  return `https://${EXERCISEDB_HOST}/image?exerciseId=${id}&resolution=180`;
+function exerciseImageUrl(exercise) {
+  return exercise.imageUrl || null;
 }
 
 // ══════════════════════════════════════════
@@ -576,31 +597,15 @@ function BottomNav({ tab, onTabChange }) {
   );
 }
 
-// ─── Exercise Image (fetches with API key headers) ───
-const gifCache = {};
-function ExerciseGif({ exerciseId, size }) {
-  const [src, setSrc] = useState(gifCache[exerciseId] || null);
-  useEffect(() => {
-    if (!exerciseId || gifCache[exerciseId]) return;
-    let cancelled = false;
-    fetch(exerciseImageUrl(exerciseId), { headers: EXERCISEDB_HEADERS })
-      .then(r => r.blob())
-      .then(blob => {
-        const url = URL.createObjectURL(blob);
-        gifCache[exerciseId] = url;
-        if (!cancelled) setSrc(url);
-      })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [exerciseId]);
-
+// ─── Exercise Image (wger.de static images) ───
+function ExerciseImage({ imageUrl, size }) {
   const s = size || 56;
-  if (!src) return (
-    <div style={{ width: s, height: s, borderRadius: 10, flexShrink: 0, background: "rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-      <div style={{ width: 16, height: 16, border: "2px solid #64ffda", borderTopColor: "transparent", borderRadius: "50%", animation: "pulse 0.8s linear infinite" }} />
+  if (!imageUrl) return (
+    <div style={{ width: s, height: s, borderRadius: 10, flexShrink: 0, background: "rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "center", color: "#64ffda", fontSize: 20 }}>
+      💪
     </div>
   );
-  return <img src={src} alt="" style={{ width: s, height: s, borderRadius: 10, objectFit: "cover", background: "rgba(255,255,255,0.06)", flexShrink: 0 }} />;
+  return <img src={imageUrl} alt="" style={{ width: s, height: s, borderRadius: 10, objectFit: "cover", background: "rgba(255,255,255,0.06)", flexShrink: 0 }} onError={(e) => e.target.style.display = 'none'} />;
 }
 
 // ─── Exercise Search ───
@@ -647,7 +652,11 @@ function ExerciseSearch({ onSelect, onBack }) {
             data = await fetchByEquipment(selectedEquipment);
           }
           // Client-side filters
-          if (selectedEquipment && selectedPart) data = data.filter(ex => ex.equipment === selectedEquipment);
+          if (selectedEquipment && selectedPart) {
+            // Find equipment name from ID for comparison
+            const eqName = equipmentList.find(e => e.id === selectedEquipment)?.name?.toLowerCase();
+            if (eqName) data = data.filter(ex => ex.equipment === eqName);
+          }
           if (query.trim()) {
             const q = query.trim().toLowerCase();
             data = data.filter(ex => ex.name.toLowerCase().includes(q));
@@ -665,13 +674,13 @@ function ExerciseSearch({ onSelect, onBack }) {
     return () => clearTimeout(searchTimer.current);
   }, [query, selectedPart, selectedEquipment]);
 
-  const handleBodyPart = (part) => {
-    setSelectedPart(selectedPart === part ? null : part);
+  const handleBodyPart = (partId) => {
+    setSelectedPart(selectedPart === partId ? null : partId);
     setQuery("");
   };
 
-  const handleEquipment = (eq) => {
-    setSelectedEquipment(selectedEquipment === eq ? null : eq);
+  const handleEquipment = (eqId) => {
+    setSelectedEquipment(selectedEquipment === eqId ? null : eqId);
     setQuery("");
   };
 
@@ -704,13 +713,13 @@ function ExerciseSearch({ onSelect, onBack }) {
           </div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
             {bodyParts.map(part => (
-              <button key={part} onClick={() => handleBodyPart(part)} style={{
+              <button key={part.id} onClick={() => handleBodyPart(part.id)} style={{
                 padding: "6px 12px", borderRadius: 16, fontSize: 11, fontWeight: 600,
                 textTransform: "capitalize", cursor: "pointer", border: "none",
-                background: selectedPart === part ? "#64ffda" : "rgba(255,255,255,0.06)",
-                color: selectedPart === part ? "#0a192f" : "#ccd6f6",
+                background: selectedPart === part.id ? "#64ffda" : "rgba(255,255,255,0.06)",
+                color: selectedPart === part.id ? "#0a192f" : "#ccd6f6",
                 transition: "all 0.2s ease"
-              }}>{part}</button>
+              }}>{part.name}</button>
             ))}
           </div>
         </div>
@@ -728,13 +737,13 @@ function ExerciseSearch({ onSelect, onBack }) {
               padding: "4px", marginRight: "-4px"
             }}>
               {equipmentList.map(eq => (
-                <button key={eq} onClick={() => handleEquipment(eq)} style={{
+                <button key={eq.id} onClick={() => handleEquipment(eq.id)} style={{
                   padding: "6px 12px", borderRadius: 16, fontSize: 11, fontWeight: 600,
                   cursor: "pointer", border: "none", textTransform: "capitalize",
-                  background: selectedEquipment === eq ? "#e94560" : "rgba(255,255,255,0.06)",
-                  color: selectedEquipment === eq ? "#fff" : "#ccd6f6",
+                  background: selectedEquipment === eq.id ? "#e94560" : "rgba(255,255,255,0.06)",
+                  color: selectedEquipment === eq.id ? "#fff" : "#ccd6f6",
                   transition: "all 0.2s ease", flexShrink: 0
-                }}>{eq}</button>
+                }}>{eq.name}</button>
               ))}
             </div>
           </div>
@@ -758,7 +767,7 @@ function ExerciseSearch({ onSelect, onBack }) {
           <div onClick={() => setExpanded(expanded === i ? null : i)} style={{
             display: "flex", alignItems: "center", gap: 14, padding: 14, cursor: "pointer"
           }}>
-            <ExerciseGif exerciseId={ex.id} size={56} />
+            <ExerciseImage imageUrl={ex.imageUrl} size={56} />
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ color: "#ccd6f6", fontSize: 15, fontWeight: 600, textTransform: "capitalize", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {ex.name}
@@ -780,7 +789,7 @@ function ExerciseSearch({ onSelect, onBack }) {
           {expanded === i && (
             <div style={{ padding: "0 14px 14px", borderTop: "1px solid rgba(255,255,255,0.06)" }}>
               <div style={{ display: "flex", justifyContent: "center", paddingTop: 14, marginBottom: 14 }}>
-                <ExerciseGif exerciseId={ex.id} size={180} />
+                <ExerciseImage imageUrl={ex.imageUrl} size={180} />
               </div>
               <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 10 }}>
                 <div style={{ background: "rgba(100,255,218,0.08)", borderRadius: 8, padding: "8px 14px" }}>

@@ -45,6 +45,16 @@ const DB_VERSION = 1;
 const WGER_BASE_URL = "https://wger.de/api/v2";
 const WGER_LANGUAGE = 2; // English
 
+// Category ID → Primary Muscle ID mapping for focused filtering
+const CATEGORY_TO_MUSCLE = {
+  10: 6,  // Abs → Rectus abdominis
+  11: 4,  // Chest → Pectoralis major
+  12: 12, // Back → Latissimus dorsi
+  13: 2,  // Shoulders → Anterior deltoid
+  14: 7,  // Calves → Gastrocnemius
+  // Arms (8), Legs (9), Cardio (15) use category filter (multiple muscles)
+};
+
 // ══════════════════════════════════════════
 //  IndexedDB
 // ══════════════════════════════════════════
@@ -166,12 +176,27 @@ async function fetchBodyPartList() {
 }
 
 async function fetchByBodyPart(categoryId) {
-  const resp = await fetch(
-    `${WGER_BASE_URL}/exerciseinfo/?language=${WGER_LANGUAGE}&category=${categoryId}&limit=100&offset=0`
-  );
-  if (!resp.ok) throw new Error("API request failed");
-  const data = await resp.json();
-  return data.results.map(transformExercise);
+  const primaryMuscleId = CATEGORY_TO_MUSCLE[categoryId];
+
+  if (primaryMuscleId) {
+    // Use muscle filtering for focused results
+    const resp = await fetch(
+      `${WGER_BASE_URL}/exerciseinfo/?language=${WGER_LANGUAGE}&muscles=${primaryMuscleId}&limit=100&offset=0`
+    );
+    if (!resp.ok) throw new Error("API request failed");
+    const data = await resp.json();
+    // Only show exercises where this muscle is the PRIMARY focus (first in array)
+    const focused = data.results.filter(ex => ex.muscles?.[0]?.id === primaryMuscleId);
+    return focused.map(transformExercise);
+  } else {
+    // Fall back to category filter for Arms, Legs, Cardio
+    const resp = await fetch(
+      `${WGER_BASE_URL}/exerciseinfo/?language=${WGER_LANGUAGE}&category=${categoryId}&limit=100&offset=0`
+    );
+    if (!resp.ok) throw new Error("API request failed");
+    const data = await resp.json();
+    return data.results.map(transformExercise);
+  }
 }
 
 async function fetchByEquipment(equipmentId) {

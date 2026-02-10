@@ -131,7 +131,7 @@ async function fetchAllWeeks() {
 // ══════════════════════════════════════════
 async function searchExercises(query) {
   const resp = await fetch(
-    `https://${EXERCISEDB_HOST}/exercises/name/${encodeURIComponent(query.toLowerCase())}?limit=20&offset=0`,
+    `https://${EXERCISEDB_HOST}/exercises/name/${encodeURIComponent(query.toLowerCase())}?limit=100&offset=0`,
     { headers: EXERCISEDB_HEADERS }
   );
   if (!resp.ok) throw new Error("API request failed");
@@ -146,7 +146,7 @@ async function fetchBodyPartList() {
 
 async function fetchByBodyPart(bodyPart) {
   const resp = await fetch(
-    `https://${EXERCISEDB_HOST}/exercises/bodyPart/${encodeURIComponent(bodyPart)}?limit=30&offset=0`,
+    `https://${EXERCISEDB_HOST}/exercises/bodyPart/${encodeURIComponent(bodyPart)}?limit=100&offset=0`,
     { headers: EXERCISEDB_HEADERS }
   );
   if (!resp.ok) throw new Error("API request failed");
@@ -155,7 +155,7 @@ async function fetchByBodyPart(bodyPart) {
 
 async function fetchByEquipment(equipment) {
   const resp = await fetch(
-    `https://${EXERCISEDB_HOST}/exercises/equipment/${encodeURIComponent(equipment)}?limit=50&offset=0`,
+    `https://${EXERCISEDB_HOST}/exercises/equipment/${encodeURIComponent(equipment)}?limit=100&offset=0`,
     { headers: EXERCISEDB_HEADERS }
   );
   if (!resp.ok) throw new Error("API request failed");
@@ -618,8 +618,11 @@ function ExerciseSearch({ onSelect, onBack }) {
 
   // Load body part + equipment lists on mount
   useEffect(() => {
-    fetchBodyPartList().then(setBodyParts).catch(() => {});
-    fetchEquipmentList().then(setEquipmentList).catch(() => {});
+    fetchBodyPartList().then(setBodyParts).catch(err => console.error("Failed to load body parts:", err));
+    fetchEquipmentList().then(list => {
+      console.log("Equipment list loaded:", list.length, "items");
+      setEquipmentList(list);
+    }).catch(err => console.error("Failed to load equipment list:", err));
   }, []);
 
   // Unified fetch: triggers when query, selectedPart, or selectedEquipment changes
@@ -632,20 +635,29 @@ function ExerciseSearch({ onSelect, onBack }) {
       setSearching(true); setError(null); setExpanded(null);
       try {
         let data;
-        // Pick the most specific API fetch, then cross-filter the rest client-side
-        if (query.trim()) {
+        // Strategy: When filters are active, fetch by filter (more complete results), then search client-side
+        // This avoids missing exercises due to search API's 20-result limit
+        if (selectedPart || selectedEquipment) {
+          // Filters active: fetch by most restrictive filter, then search/filter client-side
+          if (selectedPart && selectedEquipment) {
+            data = await fetchByBodyPart(selectedPart); // Usually smaller set
+          } else if (selectedPart) {
+            data = await fetchByBodyPart(selectedPart);
+          } else {
+            data = await fetchByEquipment(selectedEquipment);
+          }
+          // Client-side filters
+          if (selectedEquipment && selectedPart) data = data.filter(ex => ex.equipment === selectedEquipment);
+          if (query.trim()) {
+            const q = query.trim().toLowerCase();
+            data = data.filter(ex => ex.name.toLowerCase().includes(q));
+          }
+        } else if (query.trim()) {
+          // No filters: use search API
           data = await searchExercises(query.trim());
-        } else if (selectedPart && selectedEquipment) {
-          // Fetch by body part (usually smaller set), filter by equipment
-          data = await fetchByBodyPart(selectedPart);
-        } else if (selectedPart) {
-          data = await fetchByBodyPart(selectedPart);
         } else {
-          data = await fetchByEquipment(selectedEquipment);
+          data = [];
         }
-        // Client-side cross-filters for anything not handled by the API call
-        if (selectedPart && query.trim()) data = data.filter(ex => ex.bodyPart === selectedPart);
-        if (selectedEquipment && (query.trim() || selectedPart)) data = data.filter(ex => ex.equipment === selectedEquipment);
         setResults(data);
       } catch (e) { setError("Search failed. Check your connection."); }
       setSearching(false);
@@ -678,39 +690,56 @@ function ExerciseSearch({ onSelect, onBack }) {
         />
       </div>
 
-      {/* Body part chips */}
-      <div style={{ marginBottom: 16 }}>
-        <div style={{ color: "#8892b0", fontSize: 10, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Body Part</div>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          {bodyParts.map(part => (
-            <button key={part} onClick={() => handleBodyPart(part)} style={{
-              padding: "6px 12px", borderRadius: 16, fontSize: 11, fontWeight: 600,
-              textTransform: "capitalize", cursor: "pointer", border: "none",
-              background: selectedPart === part ? "#64ffda" : "rgba(255,255,255,0.06)",
-              color: selectedPart === part ? "#0a192f" : "#ccd6f6",
-              transition: "all 0.2s ease"
-            }}>{part}</button>
-          ))}
+      {/* Filters Section Header */}
+      <div style={{ marginBottom: 20, paddingTop: 8, borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+        <div style={{ color: "#64ffda", fontSize: 13, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase", marginBottom: 16 }}>
+          Filters
         </div>
-      </div>
 
-      {/* Equipment chips */}
-      {equipmentList.length > 0 && (
+        {/* Body part chips */}
         <div style={{ marginBottom: 20 }}>
-          <div style={{ color: "#8892b0", fontSize: 10, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Equipment</div>
+          <div style={{ color: "#ccd6f6", fontSize: 12, fontWeight: 600, marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+            <span>Body Part</span>
+            {bodyParts.length > 0 && <span style={{ color: "#8892b0", fontSize: 11 }}>({bodyParts.length})</span>}
+          </div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-            {equipmentList.map(eq => (
-              <button key={eq} onClick={() => handleEquipment(eq)} style={{
+            {bodyParts.map(part => (
+              <button key={part} onClick={() => handleBodyPart(part)} style={{
                 padding: "6px 12px", borderRadius: 16, fontSize: 11, fontWeight: 600,
-                cursor: "pointer", border: "none", textTransform: "capitalize",
-                background: selectedEquipment === eq ? "#e94560" : "rgba(255,255,255,0.06)",
-                color: selectedEquipment === eq ? "#fff" : "#ccd6f6",
+                textTransform: "capitalize", cursor: "pointer", border: "none",
+                background: selectedPart === part ? "#64ffda" : "rgba(255,255,255,0.06)",
+                color: selectedPart === part ? "#0a192f" : "#ccd6f6",
                 transition: "all 0.2s ease"
-              }}>{eq}</button>
+              }}>{part}</button>
             ))}
           </div>
         </div>
-      )}
+
+        {/* Equipment chips */}
+        {equipmentList.length > 0 && (
+          <div style={{ marginBottom: 20 }}>
+            <div style={{ color: "#ccd6f6", fontSize: 12, fontWeight: 600, marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+              <span>Equipment</span>
+              <span style={{ color: "#8892b0", fontSize: 11 }}>({equipmentList.length})</span>
+            </div>
+            <div style={{
+              display: "flex", gap: 6, flexWrap: "wrap",
+              maxHeight: "200px", overflowY: "auto",
+              padding: "4px", marginRight: "-4px"
+            }}>
+              {equipmentList.map(eq => (
+                <button key={eq} onClick={() => handleEquipment(eq)} style={{
+                  padding: "6px 12px", borderRadius: 16, fontSize: 11, fontWeight: 600,
+                  cursor: "pointer", border: "none", textTransform: "capitalize",
+                  background: selectedEquipment === eq ? "#e94560" : "rgba(255,255,255,0.06)",
+                  color: selectedEquipment === eq ? "#fff" : "#ccd6f6",
+                  transition: "all 0.2s ease", flexShrink: 0
+                }}>{eq}</button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
 
       {searching && (
         <div style={{ textAlign: "center", padding: 32, color: "#8892b0", fontSize: 13, letterSpacing: 2, animation: "pulse 1.5s infinite" }}>

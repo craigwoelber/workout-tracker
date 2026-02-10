@@ -135,6 +135,7 @@ function transformExercise(wgerEx) {
   return {
     id: wgerEx.id,
     name: trans.name || "Unknown Exercise",
+    description: trans.description || "",
     bodyPart: wgerEx.category?.name?.toLowerCase() || "general",
     target: wgerEx.muscles?.[0]?.name_en || wgerEx.muscles?.[0]?.name || wgerEx.category?.name || "general",
     equipment: wgerEx.equipment?.[0]?.name?.toLowerCase() || "body weight",
@@ -811,6 +812,15 @@ function ExerciseSearch({ onSelect, onBack }) {
                 <div style={{ marginBottom: 10 }}>
                   <div style={{ color: "#8892b0", fontSize: 11, letterSpacing: 1, textTransform: "uppercase", marginBottom: 4 }}>Secondary Muscles</div>
                   <div style={{ color: "#ccd6f6", fontSize: 13, textTransform: "capitalize" }}>{ex.secondaryMuscles.join(", ")}</div>
+                </div>
+              )}
+              {ex.description && (
+                <div style={{ marginTop: 10, marginBottom: 10 }}>
+                  <div style={{ color: "#64ffda", fontSize: 10, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Instructions</div>
+                  <div
+                    style={{ color: "#ccd6f6", fontSize: 13, lineHeight: 1.6 }}
+                    dangerouslySetInnerHTML={{ __html: ex.description }}
+                  />
                 </div>
               )}
               {ex.instructions?.length > 0 && (

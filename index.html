@@ -30,21 +30,32 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="config.js"></script>
 <script type="text/babel">
 const { useState, useEffect, useCallback, useRef } = React;
 
 // ══════════════════════════════════════════
 //  CONFIG
 // ══════════════════════════════════════════
-const SHEET_ID = "14SjL6EHtrmGMF84Y2mIQs-ZUPoeYSh_VQNfi-I1ukhQ";
+if (!window.CONFIG) throw new Error("config.js not loaded — copy config.example.js to config.js and fill in your values");
+const SHEET_ID = window.CONFIG.sheetId;
 const WEEKS = ["WEEK 1","WEEK 2","WEEK 3","WEEK 4","WEEK 5","WEEK 6","WEEK 7","WEEK 8","DELOAD"];
 const DB_NAME = "WorkoutTrackerDB";
 const DB_VERSION = 1;
 
-// ExerciseDB API
-const EXERCISEDB_HOST = "exercisedb.p.rapidapi.com";
-const EXERCISEDB_KEY = "6053294d2cmsh784416a9d0bf043p1c1eecjsn4b4efb735ed8";
-const EXERCISEDB_HEADERS = { "X-RapidAPI-Key": EXERCISEDB_KEY, "X-RapidAPI-Host": EXERCISEDB_HOST };
+// Wger.de API
+const WGER_BASE_URL = "https://wger.de/api/v2";
+const WGER_LANGUAGE = 2; // English
+
+// Category ID → Primary Muscle ID mapping for focused filtering
+const CATEGORY_TO_MUSCLE = {
+  10: 6,  // Abs → Rectus abdominis
+  11: 4,  // Chest → Pectoralis major
+  12: 12, // Back → Latissimus dorsi
+  13: 2,  // Shoulders → Anterior deltoid
+  14: 7,  // Calves → Gastrocnemius
+  // Arms (8), Legs (9), Cardio (15) use category filter (multiple muscles)
+};
 
 // ══════════════════════════════════════════
 //  IndexedDB
@@ -127,49 +138,312 @@ async function fetchAllWeeks() {
 }
 
 // ══════════════════════════════════════════
-//  ExerciseDB API
+//  Sheets Auth (Service Account JWT)
 // ══════════════════════════════════════════
+function b64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function pemToBuffer(pem) {
+  const b64 = pem.replace(/-----[^-]+-----/g, '').replace(/\s/g, '');
+  const bin = atob(b64);
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf.buffer;
+}
+
+async function createServiceAccountJWT() {
+  const key = window.CONFIG.serviceAccountKey;
+  const now = Math.floor(Date.now() / 1000);
+  const enc = new TextEncoder();
+  const header = b64url(enc.encode(JSON.stringify({ alg: "RS256", typ: "JWT" })));
+  const payload = b64url(enc.encode(JSON.stringify({
+    iss: key.client_email,
+    scope: "https://www.googleapis.com/auth/spreadsheets",
+    aud: key.token_uri,
+    iat: now,
+    exp: now + 3600,
+  })));
+  const sigInput = `${header}.${payload}`;
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8", pemToBuffer(key.private_key),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false, ["sign"]
+  );
+  const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, enc.encode(sigInput));
+  return `${sigInput}.${b64url(sig)}`;
+}
+
+let _gToken = null, _gTokenExp = 0;
+async function getAccessToken() {
+  if (_gToken && Date.now() < _gTokenExp) return _gToken;
+  const jwt = await createServiceAccountJWT();
+  const resp = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
+  });
+  if (!resp.ok) throw new Error(`Sheets auth failed: ${resp.status} ${await resp.text()}`);
+  const { access_token, expires_in } = await resp.json();
+  _gToken = access_token;
+  _gTokenExp = Date.now() + (expires_in - 60) * 1000;
+  return _gToken;
+}
+
+// ══════════════════════════════════════════
+//  Sheets API
+// ══════════════════════════════════════════
+const SHEETS_BASE = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}`;
+
+async function sheetsReq(method, path, body) {
+  const token = await getAccessToken();
+  const opts = {
+    method,
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+  };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const resp = await fetch(`${SHEETS_BASE}${path}`, opts);
+  if (!resp.ok) throw new Error(`Sheets ${method} ${path}: ${resp.status} ${await resp.text()}`);
+  return resp.json();
+}
+
+async function sheetsRead(tab) {
+  const data = await sheetsReq("GET", `/values/${encodeURIComponent(tab)}`);
+  return (data.values || []).slice(1); // skip header row
+}
+
+async function sheetsAppend(tab, rows) {
+  if (!rows.length) return;
+  return sheetsReq("POST",
+    `/values/${encodeURIComponent(tab)}:append?valueInputOption=USER_ENTERED`,
+    { values: rows }
+  );
+}
+
+async function sheetsOverwrite(tab, rows) {
+  await sheetsReq("POST", `/values/${encodeURIComponent(tab)}!A2:Z:clear`, {});
+  if (rows.length) await sheetsAppend(tab, rows);
+}
+
+// ══════════════════════════════════════════
+//  Data Translators (Sheets ↔ App format)
+// ══════════════════════════════════════════
+function rowsToExerciseMap(rows) {
+  const map = {};
+  for (const [id, name, muscleGroup, equipment] of rows) {
+    if (id) map[id] = { id, name, muscleGroup: muscleGroup || "", equipment: equipment || "" };
+  }
+  return map;
+}
+
+function findExIdByName(name, exMap) {
+  return Object.values(exMap).find(e => e.name === name)?.id ?? null;
+}
+
+function rowsToRoutines(rows, exMap) {
+  const map = {};
+  for (const [routineId, routineName, exerciseId, order, sets, reps] of rows) {
+    if (!routineId) continue;
+    if (!map[routineId]) map[routineId] = { id: routineId, name: routineName, exercises: [] };
+    const ex = exMap[exerciseId];
+    if (ex) {
+      map[routineId].exercises.push({
+        name: ex.name,
+        sets: parseInt(sets) || 3,
+        reps: reps || "8-12",
+        rest: "2",
+        _order: parseInt(order) || 0,
+      });
+    }
+  }
+  for (const r of Object.values(map)) {
+    r.exercises.sort((a, b) => a._order - b._order);
+    r.exercises.forEach(e => delete e._order);
+  }
+  return map;
+}
+
+function rowsToPrograms(rows) {
+  const map = {};
+  for (const [programId, programName, weekNum, dayNum, routineId] of rows) {
+    if (!programId) continue;
+    if (!map[programId]) map[programId] = { id: programId, name: programName, weeks: [] };
+    const prog = map[programId];
+    const wi = parseInt(weekNum) - 1;
+    const di = parseInt(dayNum) - 1;
+    while (prog.weeks.length <= wi) prog.weeks.push({ name: `WEEK ${prog.weeks.length + 1}`, days: [] });
+    while (prog.weeks[wi].days.length <= di) prog.weeks[wi].days.push({ routineId: null });
+    prog.weeks[wi].days[di] = { routineId };
+  }
+  return map;
+}
+
+function rowsToHistory(rows, exMap) {
+  const groups = {};
+  for (const row of rows) {
+    const [, date, exerciseId, setNum, weight, reps] = row;
+    if (!exerciseId || !date) continue;
+    const ex = exMap[exerciseId];
+    if (!ex) continue;
+    const key = `${date}|${exerciseId}`;
+    if (!groups[key]) groups[key] = { exName: ex.name, date, sets: [] };
+    const idx = Math.max(0, parseInt(setNum) - 1);
+    groups[key].sets[idx] = weight && reps ? `${weight}×${reps}` : (weight || reps || "");
+  }
+  const history = {};
+  for (const { exName, date, sets } of Object.values(groups)) {
+    if (!history[exName]) history[exName] = [];
+    history[exName].push({ week: date, day: 0, sets: sets.filter(Boolean) });
+  }
+  return history;
+}
+
+function routinesToRows(routinesObj, exMap) {
+  const rows = [];
+  for (const routine of Object.values(routinesObj)) {
+    routine.exercises.forEach((ex, i) => {
+      const exId = findExIdByName(ex.name, exMap) || `ex_${ex.name.replace(/\s+/g, '_').toLowerCase()}`;
+      rows.push([routine.id, routine.name, exId, i + 1, ex.sets || 3, ex.reps || "8-12"]);
+    });
+  }
+  return rows;
+}
+
+function programsToRows(programsObj) {
+  const rows = [];
+  for (const program of Object.values(programsObj)) {
+    program.weeks.forEach((week, wi) => {
+      week.days.forEach((day, di) => {
+        if (day.routineId) rows.push([program.id, program.name, wi + 1, di + 1, day.routineId]);
+      });
+    });
+  }
+  return rows;
+}
+
+function logEntryToRow(exerciseId, setNum, entry, today) {
+  const match = String(entry).match(/^([\d.]+)[×x]([\d.]+)$/);
+  const weight = match ? match[1] : entry;
+  const reps = match ? match[2] : "";
+  const id = `log_${today}_${exerciseId}_${setNum}_${Math.random().toString(36).slice(2, 6)}`;
+  return [id, today, exerciseId, setNum, weight, reps, ""];
+}
+
+async function upsertExercises(exerciseList, exMap) {
+  const newOnes = exerciseList.filter(ex => !findExIdByName(ex.name, exMap));
+  if (!newOnes.length) return {};
+  const newRows = newOnes.map(ex => {
+    const id = `ex_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    return [id, ex.name, ex.muscleGroup || ex.bodyPart || "", ex.equipment || ""];
+  });
+  await sheetsAppend("exercises", newRows);
+  const added = {};
+  newRows.forEach(([id, name, muscleGroup, equipment]) => {
+    added[id] = { id, name, muscleGroup, equipment };
+  });
+  return added;
+}
+
+async function loadSheetsData() {
+  const [exRows, rtRows, pgRows, logRows] = await Promise.all([
+    sheetsRead("exercises"), sheetsRead("routines"),
+    sheetsRead("programs"), sheetsRead("logs"),
+  ]);
+  const exercises = rowsToExerciseMap(exRows);
+  return {
+    exercises,
+    routines: rowsToRoutines(rtRows, exercises),
+    programs: rowsToPrograms(pgRows),
+    history: rowsToHistory(logRows, exercises),
+  };
+}
+
+// ══════════════════════════════════════════
+//  Wger.de API
+// ══════════════════════════════════════════
+
+// Transform wger exercise to ExerciseDB-compatible format
+function transformExercise(wgerEx) {
+  const trans = wgerEx.translations?.find(t => t.language === WGER_LANGUAGE) || wgerEx.translations?.[0] || {};
+  const mainVideo = wgerEx.videos?.find(v => v.is_main) || wgerEx.videos?.[0];
+  return {
+    id: wgerEx.id,
+    name: trans.name || "Unknown Exercise",
+    description: trans.description || "",
+    bodyPart: wgerEx.category?.name?.toLowerCase() || "general",
+    target: wgerEx.muscles?.[0]?.name_en || wgerEx.muscles?.[0]?.name || wgerEx.category?.name || "general",
+    equipment: wgerEx.equipment?.[0]?.name?.toLowerCase() || "body weight",
+    imageUrl: wgerEx.images?.find(img => img.is_main)?.image || wgerEx.images?.[0]?.image,
+    videoUrl: mainVideo?.video,
+    hasVideo: !!mainVideo,
+    muscles: wgerEx.muscles?.map(m => m.name) || [],
+    musclesSecondary: wgerEx.muscles_secondary?.map(m => m.name) || []
+  };
+}
+
 async function searchExercises(query) {
   const resp = await fetch(
-    `https://${EXERCISEDB_HOST}/exercises/name/${encodeURIComponent(query.toLowerCase())}?limit=20&offset=0`,
-    { headers: EXERCISEDB_HEADERS }
+    `${WGER_BASE_URL}/exerciseinfo/?language=${WGER_LANGUAGE}&limit=100&offset=0`
   );
   if (!resp.ok) throw new Error("API request failed");
-  return resp.json();
+  const data = await resp.json();
+  const q = query.toLowerCase();
+  const filtered = data.results.filter(ex =>
+    ex.translations?.some(t => t.name?.toLowerCase().includes(q))
+  );
+  return filtered.map(transformExercise);
 }
 
 async function fetchBodyPartList() {
-  const resp = await fetch(`https://${EXERCISEDB_HOST}/exercises/bodyPartList`, { headers: EXERCISEDB_HEADERS });
+  const resp = await fetch(`${WGER_BASE_URL}/exercisecategory/`);
   if (!resp.ok) throw new Error("API request failed");
-  return resp.json();
+  const data = await resp.json();
+  return data.results; // Returns [{id: 11, name: "Chest"}, ...]
 }
 
-async function fetchByBodyPart(bodyPart) {
-  const resp = await fetch(
-    `https://${EXERCISEDB_HOST}/exercises/bodyPart/${encodeURIComponent(bodyPart)}?limit=30&offset=0`,
-    { headers: EXERCISEDB_HEADERS }
-  );
-  if (!resp.ok) throw new Error("API request failed");
-  return resp.json();
+async function fetchByBodyPart(categoryId) {
+  const primaryMuscleId = CATEGORY_TO_MUSCLE[categoryId];
+
+  if (primaryMuscleId) {
+    // Use muscle filtering for focused results
+    const resp = await fetch(
+      `${WGER_BASE_URL}/exerciseinfo/?language=${WGER_LANGUAGE}&muscles=${primaryMuscleId}&limit=100&offset=0`
+    );
+    if (!resp.ok) throw new Error("API request failed");
+    const data = await resp.json();
+    // Only show exercises where this muscle is the PRIMARY focus (first in array)
+    const focused = data.results.filter(ex => ex.muscles?.[0]?.id === primaryMuscleId);
+    return focused.map(transformExercise);
+  } else {
+    // Fall back to category filter for Arms, Legs, Cardio
+    const resp = await fetch(
+      `${WGER_BASE_URL}/exerciseinfo/?language=${WGER_LANGUAGE}&category=${categoryId}&limit=100&offset=0`
+    );
+    if (!resp.ok) throw new Error("API request failed");
+    const data = await resp.json();
+    return data.results.map(transformExercise);
+  }
 }
 
-async function fetchByEquipment(equipment) {
+async function fetchByEquipment(equipmentId) {
   const resp = await fetch(
-    `https://${EXERCISEDB_HOST}/exercises/equipment/${encodeURIComponent(equipment)}?limit=50&offset=0`,
-    { headers: EXERCISEDB_HEADERS }
+    `${WGER_BASE_URL}/exerciseinfo/?language=${WGER_LANGUAGE}&equipment=${equipmentId}&limit=100&offset=0`
   );
   if (!resp.ok) throw new Error("API request failed");
-  return resp.json();
+  const data = await resp.json();
+  return data.results.map(transformExercise);
 }
 
 async function fetchEquipmentList() {
-  const resp = await fetch(`https://${EXERCISEDB_HOST}/exercises/equipmentList`, { headers: EXERCISEDB_HEADERS });
+  const resp = await fetch(`${WGER_BASE_URL}/equipment/`);
   if (!resp.ok) throw new Error("API request failed");
-  return resp.json();
+  const data = await resp.json();
+  return data.results; // Returns [{id: 3, name: "Dumbbell"}, ...]
 }
 
-function exerciseImageUrl(id) {
-  return `https://${EXERCISEDB_HOST}/image?exerciseId=${id}&resolution=180`;
+function exerciseImageUrl(exercise) {
+  return exercise.imageUrl || null;
 }
 
 // ══════════════════════════════════════════
@@ -576,31 +850,24 @@ function BottomNav({ tab, onTabChange }) {
   );
 }
 
-// ─── Exercise Image (fetches with API key headers) ───
-const gifCache = {};
-function ExerciseGif({ exerciseId, size }) {
-  const [src, setSrc] = useState(gifCache[exerciseId] || null);
-  useEffect(() => {
-    if (!exerciseId || gifCache[exerciseId]) return;
-    let cancelled = false;
-    fetch(exerciseImageUrl(exerciseId), { headers: EXERCISEDB_HEADERS })
-      .then(r => r.blob())
-      .then(blob => {
-        const url = URL.createObjectURL(blob);
-        gifCache[exerciseId] = url;
-        if (!cancelled) setSrc(url);
-      })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [exerciseId]);
-
+// ─── Exercise Image (wger.de static images) ───
+function ExerciseImage({ imageUrl, size, hasVideo }) {
   const s = size || 56;
-  if (!src) return (
-    <div style={{ width: s, height: s, borderRadius: 10, flexShrink: 0, background: "rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-      <div style={{ width: 16, height: 16, border: "2px solid #64ffda", borderTopColor: "transparent", borderRadius: "50%", animation: "pulse 0.8s linear infinite" }} />
+  if (!imageUrl) return (
+    <div style={{ width: s, height: s, borderRadius: 10, flexShrink: 0, background: "rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "center", color: "#64ffda", fontSize: 20 }}>
+      💪
     </div>
   );
-  return <img src={src} alt="" style={{ width: s, height: s, borderRadius: 10, objectFit: "cover", background: "rgba(255,255,255,0.06)", flexShrink: 0 }} />;
+  return (
+    <div style={{ position: "relative", width: s, height: s, flexShrink: 0 }}>
+      <img src={imageUrl} alt="" style={{ width: s, height: s, borderRadius: 10, objectFit: "cover", background: "rgba(255,255,255,0.06)" }} onError={(e) => e.target.style.display = 'none'} />
+      {hasVideo && (
+        <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)", background: "rgba(100,255,218,0.9)", borderRadius: "50%", width: s * 0.35, height: s * 0.35, display: "flex", alignItems: "center", justifyContent: "center", color: "#0a192f", fontSize: s * 0.2, fontWeight: "bold", pointerEvents: "none" }}>
+          ▶
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ─── Exercise Search ───
@@ -613,13 +880,17 @@ function ExerciseSearch({ onSelect, onBack }) {
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState(null);
   const [expanded, setExpanded] = useState(null);
+  const [playingVideo, setPlayingVideo] = useState(null);
   const [equipmentList, setEquipmentList] = useState([]);
   const searchTimer = useRef(null);
 
   // Load body part + equipment lists on mount
   useEffect(() => {
-    fetchBodyPartList().then(setBodyParts).catch(() => {});
-    fetchEquipmentList().then(setEquipmentList).catch(() => {});
+    fetchBodyPartList().then(setBodyParts).catch(err => console.error("Failed to load body parts:", err));
+    fetchEquipmentList().then(list => {
+      console.log("Equipment list loaded:", list.length, "items");
+      setEquipmentList(list);
+    }).catch(err => console.error("Failed to load equipment list:", err));
   }, []);
 
   // Unified fetch: triggers when query, selectedPart, or selectedEquipment changes
@@ -632,20 +903,33 @@ function ExerciseSearch({ onSelect, onBack }) {
       setSearching(true); setError(null); setExpanded(null);
       try {
         let data;
-        // Pick the most specific API fetch, then cross-filter the rest client-side
-        if (query.trim()) {
+        // Strategy: When filters are active, fetch by filter (more complete results), then search client-side
+        // This avoids missing exercises due to search API's 20-result limit
+        if (selectedPart || selectedEquipment) {
+          // Filters active: fetch by most restrictive filter, then search/filter client-side
+          if (selectedPart && selectedEquipment) {
+            data = await fetchByBodyPart(selectedPart); // Usually smaller set
+          } else if (selectedPart) {
+            data = await fetchByBodyPart(selectedPart);
+          } else {
+            data = await fetchByEquipment(selectedEquipment);
+          }
+          // Client-side filters
+          if (selectedEquipment && selectedPart) {
+            // Find equipment name from ID for comparison
+            const eqName = equipmentList.find(e => e.id === selectedEquipment)?.name?.toLowerCase();
+            if (eqName) data = data.filter(ex => ex.equipment === eqName);
+          }
+          if (query.trim()) {
+            const q = query.trim().toLowerCase();
+            data = data.filter(ex => ex.name.toLowerCase().includes(q));
+          }
+        } else if (query.trim()) {
+          // No filters: use search API
           data = await searchExercises(query.trim());
-        } else if (selectedPart && selectedEquipment) {
-          // Fetch by body part (usually smaller set), filter by equipment
-          data = await fetchByBodyPart(selectedPart);
-        } else if (selectedPart) {
-          data = await fetchByBodyPart(selectedPart);
         } else {
-          data = await fetchByEquipment(selectedEquipment);
+          data = [];
         }
-        // Client-side cross-filters for anything not handled by the API call
-        if (selectedPart && query.trim()) data = data.filter(ex => ex.bodyPart === selectedPart);
-        if (selectedEquipment && (query.trim() || selectedPart)) data = data.filter(ex => ex.equipment === selectedEquipment);
         setResults(data);
       } catch (e) { setError("Search failed. Check your connection."); }
       setSearching(false);
@@ -653,13 +937,13 @@ function ExerciseSearch({ onSelect, onBack }) {
     return () => clearTimeout(searchTimer.current);
   }, [query, selectedPart, selectedEquipment]);
 
-  const handleBodyPart = (part) => {
-    setSelectedPart(selectedPart === part ? null : part);
+  const handleBodyPart = (partId) => {
+    setSelectedPart(selectedPart === partId ? null : partId);
     setQuery("");
   };
 
-  const handleEquipment = (eq) => {
-    setSelectedEquipment(selectedEquipment === eq ? null : eq);
+  const handleEquipment = (eqId) => {
+    setSelectedEquipment(selectedEquipment === eqId ? null : eqId);
     setQuery("");
   };
 
@@ -678,39 +962,56 @@ function ExerciseSearch({ onSelect, onBack }) {
         />
       </div>
 
-      {/* Body part chips */}
-      <div style={{ marginBottom: 16 }}>
-        <div style={{ color: "#8892b0", fontSize: 10, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Body Part</div>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          {bodyParts.map(part => (
-            <button key={part} onClick={() => handleBodyPart(part)} style={{
-              padding: "6px 12px", borderRadius: 16, fontSize: 11, fontWeight: 600,
-              textTransform: "capitalize", cursor: "pointer", border: "none",
-              background: selectedPart === part ? "#64ffda" : "rgba(255,255,255,0.06)",
-              color: selectedPart === part ? "#0a192f" : "#ccd6f6",
-              transition: "all 0.2s ease"
-            }}>{part}</button>
-          ))}
+      {/* Filters Section Header */}
+      <div style={{ marginBottom: 20, paddingTop: 8, borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+        <div style={{ color: "#64ffda", fontSize: 13, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase", marginBottom: 16 }}>
+          Filters
         </div>
-      </div>
 
-      {/* Equipment chips */}
-      {equipmentList.length > 0 && (
+        {/* Body part chips */}
         <div style={{ marginBottom: 20 }}>
-          <div style={{ color: "#8892b0", fontSize: 10, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Equipment</div>
+          <div style={{ color: "#ccd6f6", fontSize: 12, fontWeight: 600, marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+            <span>Body Part</span>
+            {bodyParts.length > 0 && <span style={{ color: "#8892b0", fontSize: 11 }}>({bodyParts.length})</span>}
+          </div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-            {equipmentList.map(eq => (
-              <button key={eq} onClick={() => handleEquipment(eq)} style={{
+            {bodyParts.map(part => (
+              <button key={part.id} onClick={() => handleBodyPart(part.id)} style={{
                 padding: "6px 12px", borderRadius: 16, fontSize: 11, fontWeight: 600,
-                cursor: "pointer", border: "none", textTransform: "capitalize",
-                background: selectedEquipment === eq ? "#e94560" : "rgba(255,255,255,0.06)",
-                color: selectedEquipment === eq ? "#fff" : "#ccd6f6",
+                textTransform: "capitalize", cursor: "pointer", border: "none",
+                background: selectedPart === part.id ? "#64ffda" : "rgba(255,255,255,0.06)",
+                color: selectedPart === part.id ? "#0a192f" : "#ccd6f6",
                 transition: "all 0.2s ease"
-              }}>{eq}</button>
+              }}>{part.name}</button>
             ))}
           </div>
         </div>
-      )}
+
+        {/* Equipment chips */}
+        {equipmentList.length > 0 && (
+          <div style={{ marginBottom: 20 }}>
+            <div style={{ color: "#ccd6f6", fontSize: 12, fontWeight: 600, marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+              <span>Equipment</span>
+              <span style={{ color: "#8892b0", fontSize: 11 }}>({equipmentList.length})</span>
+            </div>
+            <div style={{
+              display: "flex", gap: 6, flexWrap: "wrap",
+              maxHeight: "200px", overflowY: "auto",
+              padding: "4px", marginRight: "-4px"
+            }}>
+              {equipmentList.map(eq => (
+                <button key={eq.id} onClick={() => handleEquipment(eq.id)} style={{
+                  padding: "6px 12px", borderRadius: 16, fontSize: 11, fontWeight: 600,
+                  cursor: "pointer", border: "none", textTransform: "capitalize",
+                  background: selectedEquipment === eq.id ? "#e94560" : "rgba(255,255,255,0.06)",
+                  color: selectedEquipment === eq.id ? "#fff" : "#ccd6f6",
+                  transition: "all 0.2s ease", flexShrink: 0
+                }}>{eq.name}</button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
 
       {searching && (
         <div style={{ textAlign: "center", padding: 32, color: "#8892b0", fontSize: 13, letterSpacing: 2, animation: "pulse 1.5s infinite" }}>
@@ -729,7 +1030,7 @@ function ExerciseSearch({ onSelect, onBack }) {
           <div onClick={() => setExpanded(expanded === i ? null : i)} style={{
             display: "flex", alignItems: "center", gap: 14, padding: 14, cursor: "pointer"
           }}>
-            <ExerciseGif exerciseId={ex.id} size={56} />
+            <ExerciseImage imageUrl={ex.imageUrl} size={56} hasVideo={ex.hasVideo} />
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ color: "#ccd6f6", fontSize: 15, fontWeight: 600, textTransform: "capitalize", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {ex.name}
@@ -751,7 +1052,19 @@ function ExerciseSearch({ onSelect, onBack }) {
           {expanded === i && (
             <div style={{ padding: "0 14px 14px", borderTop: "1px solid rgba(255,255,255,0.06)" }}>
               <div style={{ display: "flex", justifyContent: "center", paddingTop: 14, marginBottom: 14 }}>
-                <ExerciseGif exerciseId={ex.id} size={180} />
+                {ex.hasVideo && playingVideo === i ? (
+                  <video
+                    src={ex.videoUrl}
+                    controls
+                    autoPlay
+                    style={{ width: "100%", maxWidth: 320, borderRadius: 10, background: "#000" }}
+                    onEnded={() => setPlayingVideo(null)}
+                  />
+                ) : (
+                  <div onClick={() => ex.hasVideo && setPlayingVideo(i)} style={{ cursor: ex.hasVideo ? "pointer" : "default" }}>
+                    <ExerciseImage imageUrl={ex.imageUrl} size={180} hasVideo={ex.hasVideo} />
+                  </div>
+                )}
               </div>
               <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 10 }}>
                 <div style={{ background: "rgba(100,255,218,0.08)", borderRadius: 8, padding: "8px 14px" }}>
@@ -773,6 +1086,15 @@ function ExerciseSearch({ onSelect, onBack }) {
                 <div style={{ marginBottom: 10 }}>
                   <div style={{ color: "#8892b0", fontSize: 11, letterSpacing: 1, textTransform: "uppercase", marginBottom: 4 }}>Secondary Muscles</div>
                   <div style={{ color: "#ccd6f6", fontSize: 13, textTransform: "capitalize" }}>{ex.secondaryMuscles.join(", ")}</div>
+                </div>
+              )}
+              {ex.description && (
+                <div style={{ marginTop: 10, marginBottom: 10 }}>
+                  <div style={{ color: "#64ffda", fontSize: 10, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Instructions</div>
+                  <div
+                    style={{ color: "#ccd6f6", fontSize: 13, lineHeight: 1.6 }}
+                    dangerouslySetInnerHTML={{ __html: ex.description }}
+                  />
                 </div>
               )}
               {ex.instructions?.length > 0 && (
@@ -1215,6 +1537,7 @@ function App() {
   // Builder state
   const [tab, setTab] = useState("workout"); // workout | build
   const [buildView, setBuildView] = useState("home"); // home | search | editRoutine | editProgram
+  const [exercises, setExercises] = useState({}); // { [exercise_id]: { id, name, muscleGroup, equipment } }
   const [routines, setRoutines] = useState({}); // { id: { id, name, exercises } }
   const [programs, setPrograms] = useState({}); // { id: { id, name, weeks } }
   const [activeSource, setActiveSource] = useState({ type: "sheets" });
@@ -1222,8 +1545,19 @@ function App() {
   const [editingRoutineId, setEditingRoutineId] = useState(null);
   const [editingProgramId, setEditingProgramId] = useState(null);
 
-  const saveRoutines = useCallback(async (r) => { setRoutines(r); await dbSet("routines", r); }, []);
-  const savePrograms = useCallback(async (p) => { setPrograms(p); await dbSet("programs", p); }, []);
+  const saveRoutines = useCallback(async (r) => {
+    setRoutines(r);
+    const allExercises = Object.values(r).flatMap(rt => rt.exercises);
+    const added = await upsertExercises(allExercises, exercises);
+    const newExMap = Object.keys(added).length ? { ...exercises, ...added } : exercises;
+    if (Object.keys(added).length) setExercises(newExMap);
+    await sheetsOverwrite("routines", routinesToRows(r, newExMap));
+  }, [exercises]);
+
+  const savePrograms = useCallback(async (p) => {
+    setPrograms(p);
+    await sheetsOverwrite("programs", programsToRows(p));
+  }, []);
   const saveActiveSource = useCallback(async (s) => { setActiveSource(s); await dbSet("activeSource", s); }, []);
 
   function resolveProgram(program, rts) {
@@ -1271,40 +1605,36 @@ function App() {
     await save(0, 0, defTimer);
   }
 
-  // ─── Init: load from IDB, then fetch plan ───
+  // ─── Init: load from Sheets + IDB ───
   useEffect(() => {
     (async () => {
       try {
-        // Load saved state
-        const [savedState, savedLogged, savedHistory, savedPlan, savedRoutines, savedPrograms, savedSource] = await Promise.all([
-          dbGet("state"), dbGet("logged"), dbGet("history"), dbGet("plan"),
-          dbGet("routines"), dbGet("programs"), dbGet("activeSource")
+        const [savedState, savedPlan, savedSource, sheetsData] = await Promise.all([
+          dbGet("state"), dbGet("plan"), dbGet("activeSource"), loadSheetsData(),
         ]);
         if (savedState) {
           setWeekIdx(savedState.weekIdx ?? 0);
           setDayIdx(savedState.dayIdx ?? 0);
           setDefTimer(savedState.defTimer ?? 60);
         }
-        if (savedLogged) setLogged(savedLogged);
-        if (savedHistory) setHistory(savedHistory);
-        if (savedRoutines) setRoutines(savedRoutines);
-        if (savedPrograms) setPrograms(savedPrograms);
+        setExercises(sheetsData.exercises);
+        setRoutines(sheetsData.routines);
+        setPrograms(sheetsData.programs);
+        setHistory(sheetsData.history);
         if (savedSource) setActiveSource(savedSource);
 
         // Load plan based on active source
         const src = savedSource || { type: "sheets" };
-        if (src.type === "program" && savedPrograms && savedRoutines && savedPrograms[src.programId]) {
-          const resolved = resolveProgram(savedPrograms[src.programId], savedRoutines);
+        if (src.type === "program" && sheetsData.programs[src.programId]) {
+          const resolved = resolveProgram(sheetsData.programs[src.programId], sheetsData.routines);
           setPlan(resolved);
           setActiveWeeks(Object.keys(resolved));
         } else {
-          // Try fetching fresh plan from sheet
           try {
             const freshPlan = await fetchAllWeeks();
             setPlan(freshPlan);
             await dbSet("plan", freshPlan);
           } catch (e) {
-            // Offline - use cached plan
             if (savedPlan) {
               setPlan(savedPlan);
             } else {
@@ -1325,8 +1655,8 @@ function App() {
     await dbSet("state", { weekIdx: wk, dayIdx: dy, defTimer: tmr });
   }, []);
 
-  const saveLogs = useCallback(async (l) => { setLogged(l); await dbSet("logged", l); }, []);
-  const saveHist = useCallback(async (h) => { setHistory(h); await dbSet("history", h); }, []);
+  const saveLogs = useCallback((l) => { setLogged(l); }, []);
+  const saveHist = useCallback((h) => { setHistory(h); }, []);
 
   const curWeek = plan ? plan[activeWeeks[weekIdx]] : null;
   const curDay = curWeek?.[dayIdx];
@@ -1353,12 +1683,18 @@ function App() {
   };
 
   const handleLog = (entry) => {
+    const setNum = curLogs.length + 1;
     const newLogs = [...curLogs, entry];
     const newAll = { ...logged, [curKey]: newLogs };
     saveLogs(newAll);
     setEditingSet(null);
     setTimerLen(getRestSec(curEx.rest));
     setTimer(true);
+    // Async write to Sheets (fire and forget)
+    const exId = findExIdByName(curEx.name, exercises) || curEx.name;
+    const today = new Date().toISOString().slice(0, 10);
+    sheetsAppend("logs", [logEntryToRow(exId, setNum, entry, today)])
+      .catch(e => console.error("Sheets log sync error:", e));
   };
 
   const handleTimerDone = useCallback(() => {
@@ -1541,8 +1877,7 @@ function App() {
           <div style={{ color: "#e94560", fontWeight: 700, fontSize: 14, marginBottom: 10 }}>Danger Zone</div>
           <button onClick={async () => {
             if (confirm("Clear ALL logged workout data and history? This cannot be undone.")) {
-              await dbSet("logged", {});
-              await dbSet("history", {});
+              await sheetsOverwrite("logs", []);
               setLogged({}); setHistory({});
             }
           }} style={{

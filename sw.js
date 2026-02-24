@@ -1,4 +1,4 @@
-const CACHE_NAME = 'workout-v3';
+const CACHE_NAME = 'workout-v5';
 const ASSETS = [
   './',
   './index.html',
@@ -52,8 +52,8 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // For ExerciseDB API calls - network first, cache for offline
-  if (url.hostname === 'exercisedb.p.rapidapi.com') {
+  // For Wger.de API calls - network first, cache for offline
+  if (url.hostname === 'wger.de') {
     e.respondWith(
       fetch(e.request)
         .then(resp => {

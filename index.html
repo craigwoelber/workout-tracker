@@ -30,13 +30,15 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="config.js"></script>
 <script type="text/babel">
 const { useState, useEffect, useCallback, useRef } = React;
 
 // ══════════════════════════════════════════
 //  CONFIG
 // ══════════════════════════════════════════
-const SHEET_ID = "14SjL6EHtrmGMF84Y2mIQs-ZUPoeYSh_VQNfi-I1ukhQ";
+if (!window.CONFIG) throw new Error("config.js not loaded — copy config.example.js to config.js and fill in your values");
+const SHEET_ID = window.CONFIG.sheetId;
 const WEEKS = ["WEEK 1","WEEK 2","WEEK 3","WEEK 4","WEEK 5","WEEK 6","WEEK 7","WEEK 8","DELOAD"];
 const DB_NAME = "WorkoutTrackerDB";
 const DB_VERSION = 1;
@@ -133,6 +135,228 @@ async function fetchAllWeeks() {
   });
   await Promise.all(fetches);
   return allData;
+}
+
+// ══════════════════════════════════════════
+//  Sheets Auth (Service Account JWT)
+// ══════════════════════════════════════════
+function b64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function pemToBuffer(pem) {
+  const b64 = pem.replace(/-----[^-]+-----/g, '').replace(/\s/g, '');
+  const bin = atob(b64);
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf.buffer;
+}
+
+async function createServiceAccountJWT() {
+  const key = window.CONFIG.serviceAccountKey;
+  const now = Math.floor(Date.now() / 1000);
+  const enc = new TextEncoder();
+  const header = b64url(enc.encode(JSON.stringify({ alg: "RS256", typ: "JWT" })));
+  const payload = b64url(enc.encode(JSON.stringify({
+    iss: key.client_email,
+    scope: "https://www.googleapis.com/auth/spreadsheets",
+    aud: key.token_uri,
+    iat: now,
+    exp: now + 3600,
+  })));
+  const sigInput = `${header}.${payload}`;
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8", pemToBuffer(key.private_key),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false, ["sign"]
+  );
+  const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, enc.encode(sigInput));
+  return `${sigInput}.${b64url(sig)}`;
+}
+
+let _gToken = null, _gTokenExp = 0;
+async function getAccessToken() {
+  if (_gToken && Date.now() < _gTokenExp) return _gToken;
+  const jwt = await createServiceAccountJWT();
+  const resp = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
+  });
+  if (!resp.ok) throw new Error(`Sheets auth failed: ${resp.status} ${await resp.text()}`);
+  const { access_token, expires_in } = await resp.json();
+  _gToken = access_token;
+  _gTokenExp = Date.now() + (expires_in - 60) * 1000;
+  return _gToken;
+}
+
+// ══════════════════════════════════════════
+//  Sheets API
+// ══════════════════════════════════════════
+const SHEETS_BASE = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}`;
+
+async function sheetsReq(method, path, body) {
+  const token = await getAccessToken();
+  const opts = {
+    method,
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+  };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const resp = await fetch(`${SHEETS_BASE}${path}`, opts);
+  if (!resp.ok) throw new Error(`Sheets ${method} ${path}: ${resp.status} ${await resp.text()}`);
+  return resp.json();
+}
+
+async function sheetsRead(tab) {
+  const data = await sheetsReq("GET", `/values/${encodeURIComponent(tab)}`);
+  return (data.values || []).slice(1); // skip header row
+}
+
+async function sheetsAppend(tab, rows) {
+  if (!rows.length) return;
+  return sheetsReq("POST",
+    `/values/${encodeURIComponent(tab)}:append?valueInputOption=USER_ENTERED`,
+    { values: rows }
+  );
+}
+
+async function sheetsOverwrite(tab, rows) {
+  await sheetsReq("POST", `/values/${encodeURIComponent(tab)}!A2:Z:clear`, {});
+  if (rows.length) await sheetsAppend(tab, rows);
+}
+
+// ══════════════════════════════════════════
+//  Data Translators (Sheets ↔ App format)
+// ══════════════════════════════════════════
+function rowsToExerciseMap(rows) {
+  const map = {};
+  for (const [id, name, muscleGroup, equipment] of rows) {
+    if (id) map[id] = { id, name, muscleGroup: muscleGroup || "", equipment: equipment || "" };
+  }
+  return map;
+}
+
+function findExIdByName(name, exMap) {
+  return Object.values(exMap).find(e => e.name === name)?.id ?? null;
+}
+
+function rowsToRoutines(rows, exMap) {
+  const map = {};
+  for (const [routineId, routineName, exerciseId, order, sets, reps] of rows) {
+    if (!routineId) continue;
+    if (!map[routineId]) map[routineId] = { id: routineId, name: routineName, exercises: [] };
+    const ex = exMap[exerciseId];
+    if (ex) {
+      map[routineId].exercises.push({
+        name: ex.name,
+        sets: parseInt(sets) || 3,
+        reps: reps || "8-12",
+        rest: "2",
+        _order: parseInt(order) || 0,
+      });
+    }
+  }
+  for (const r of Object.values(map)) {
+    r.exercises.sort((a, b) => a._order - b._order);
+    r.exercises.forEach(e => delete e._order);
+  }
+  return map;
+}
+
+function rowsToPrograms(rows) {
+  const map = {};
+  for (const [programId, programName, weekNum, dayNum, routineId] of rows) {
+    if (!programId) continue;
+    if (!map[programId]) map[programId] = { id: programId, name: programName, weeks: [] };
+    const prog = map[programId];
+    const wi = parseInt(weekNum) - 1;
+    const di = parseInt(dayNum) - 1;
+    while (prog.weeks.length <= wi) prog.weeks.push({ name: `WEEK ${prog.weeks.length + 1}`, days: [] });
+    while (prog.weeks[wi].days.length <= di) prog.weeks[wi].days.push({ routineId: null });
+    prog.weeks[wi].days[di] = { routineId };
+  }
+  return map;
+}
+
+function rowsToHistory(rows, exMap) {
+  const groups = {};
+  for (const row of rows) {
+    const [, date, exerciseId, setNum, weight, reps] = row;
+    if (!exerciseId || !date) continue;
+    const ex = exMap[exerciseId];
+    if (!ex) continue;
+    const key = `${date}|${exerciseId}`;
+    if (!groups[key]) groups[key] = { exName: ex.name, date, sets: [] };
+    const idx = Math.max(0, parseInt(setNum) - 1);
+    groups[key].sets[idx] = weight && reps ? `${weight}×${reps}` : (weight || reps || "");
+  }
+  const history = {};
+  for (const { exName, date, sets } of Object.values(groups)) {
+    if (!history[exName]) history[exName] = [];
+    history[exName].push({ week: date, day: 0, sets: sets.filter(Boolean) });
+  }
+  return history;
+}
+
+function routinesToRows(routinesObj, exMap) {
+  const rows = [];
+  for (const routine of Object.values(routinesObj)) {
+    routine.exercises.forEach((ex, i) => {
+      const exId = findExIdByName(ex.name, exMap) || `ex_${ex.name.replace(/\s+/g, '_').toLowerCase()}`;
+      rows.push([routine.id, routine.name, exId, i + 1, ex.sets || 3, ex.reps || "8-12"]);
+    });
+  }
+  return rows;
+}
+
+function programsToRows(programsObj) {
+  const rows = [];
+  for (const program of Object.values(programsObj)) {
+    program.weeks.forEach((week, wi) => {
+      week.days.forEach((day, di) => {
+        if (day.routineId) rows.push([program.id, program.name, wi + 1, di + 1, day.routineId]);
+      });
+    });
+  }
+  return rows;
+}
+
+function logEntryToRow(exerciseId, setNum, entry, today) {
+  const match = String(entry).match(/^([\d.]+)[×x]([\d.]+)$/);
+  const weight = match ? match[1] : entry;
+  const reps = match ? match[2] : "";
+  const id = `log_${today}_${exerciseId}_${setNum}_${Math.random().toString(36).slice(2, 6)}`;
+  return [id, today, exerciseId, setNum, weight, reps, ""];
+}
+
+async function upsertExercises(exerciseList, exMap) {
+  const newOnes = exerciseList.filter(ex => !findExIdByName(ex.name, exMap));
+  if (!newOnes.length) return {};
+  const newRows = newOnes.map(ex => {
+    const id = `ex_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    return [id, ex.name, ex.muscleGroup || ex.bodyPart || "", ex.equipment || ""];
+  });
+  await sheetsAppend("exercises", newRows);
+  const added = {};
+  newRows.forEach(([id, name, muscleGroup, equipment]) => {
+    added[id] = { id, name, muscleGroup, equipment };
+  });
+  return added;
+}
+
+async function loadSheetsData() {
+  const [exRows, rtRows, pgRows, logRows] = await Promise.all([
+    sheetsRead("exercises"), sheetsRead("routines"),
+    sheetsRead("programs"), sheetsRead("logs"),
+  ]);
+  const exercises = rowsToExerciseMap(exRows);
+  return {
+    exercises,
+    routines: rowsToRoutines(rtRows, exercises),
+    programs: rowsToPrograms(pgRows),
+    history: rowsToHistory(logRows, exercises),
+  };
 }
 
 // ══════════════════════════════════════════
@@ -1313,6 +1537,7 @@ function App() {
   // Builder state
   const [tab, setTab] = useState("workout"); // workout | build
   const [buildView, setBuildView] = useState("home"); // home | search | editRoutine | editProgram
+  const [exercises, setExercises] = useState({}); // { [exercise_id]: { id, name, muscleGroup, equipment } }
   const [routines, setRoutines] = useState({}); // { id: { id, name, exercises } }
   const [programs, setPrograms] = useState({}); // { id: { id, name, weeks } }
   const [activeSource, setActiveSource] = useState({ type: "sheets" });
@@ -1320,8 +1545,19 @@ function App() {
   const [editingRoutineId, setEditingRoutineId] = useState(null);
   const [editingProgramId, setEditingProgramId] = useState(null);
 
-  const saveRoutines = useCallback(async (r) => { setRoutines(r); await dbSet("routines", r); }, []);
-  const savePrograms = useCallback(async (p) => { setPrograms(p); await dbSet("programs", p); }, []);
+  const saveRoutines = useCallback(async (r) => {
+    setRoutines(r);
+    const allExercises = Object.values(r).flatMap(rt => rt.exercises);
+    const added = await upsertExercises(allExercises, exercises);
+    const newExMap = Object.keys(added).length ? { ...exercises, ...added } : exercises;
+    if (Object.keys(added).length) setExercises(newExMap);
+    await sheetsOverwrite("routines", routinesToRows(r, newExMap));
+  }, [exercises]);
+
+  const savePrograms = useCallback(async (p) => {
+    setPrograms(p);
+    await sheetsOverwrite("programs", programsToRows(p));
+  }, []);
   const saveActiveSource = useCallback(async (s) => { setActiveSource(s); await dbSet("activeSource", s); }, []);
 
   function resolveProgram(program, rts) {
@@ -1369,40 +1605,36 @@ function App() {
     await save(0, 0, defTimer);
   }
 
-  // ─── Init: load from IDB, then fetch plan ───
+  // ─── Init: load from Sheets + IDB ───
   useEffect(() => {
     (async () => {
       try {
-        // Load saved state
-        const [savedState, savedLogged, savedHistory, savedPlan, savedRoutines, savedPrograms, savedSource] = await Promise.all([
-          dbGet("state"), dbGet("logged"), dbGet("history"), dbGet("plan"),
-          dbGet("routines"), dbGet("programs"), dbGet("activeSource")
+        const [savedState, savedPlan, savedSource, sheetsData] = await Promise.all([
+          dbGet("state"), dbGet("plan"), dbGet("activeSource"), loadSheetsData(),
         ]);
         if (savedState) {
           setWeekIdx(savedState.weekIdx ?? 0);
           setDayIdx(savedState.dayIdx ?? 0);
           setDefTimer(savedState.defTimer ?? 60);
         }
-        if (savedLogged) setLogged(savedLogged);
-        if (savedHistory) setHistory(savedHistory);
-        if (savedRoutines) setRoutines(savedRoutines);
-        if (savedPrograms) setPrograms(savedPrograms);
+        setExercises(sheetsData.exercises);
+        setRoutines(sheetsData.routines);
+        setPrograms(sheetsData.programs);
+        setHistory(sheetsData.history);
         if (savedSource) setActiveSource(savedSource);
 
         // Load plan based on active source
         const src = savedSource || { type: "sheets" };
-        if (src.type === "program" && savedPrograms && savedRoutines && savedPrograms[src.programId]) {
-          const resolved = resolveProgram(savedPrograms[src.programId], savedRoutines);
+        if (src.type === "program" && sheetsData.programs[src.programId]) {
+          const resolved = resolveProgram(sheetsData.programs[src.programId], sheetsData.routines);
           setPlan(resolved);
           setActiveWeeks(Object.keys(resolved));
         } else {
-          // Try fetching fresh plan from sheet
           try {
             const freshPlan = await fetchAllWeeks();
             setPlan(freshPlan);
             await dbSet("plan", freshPlan);
           } catch (e) {
-            // Offline - use cached plan
             if (savedPlan) {
               setPlan(savedPlan);
             } else {
@@ -1423,8 +1655,8 @@ function App() {
     await dbSet("state", { weekIdx: wk, dayIdx: dy, defTimer: tmr });
   }, []);
 
-  const saveLogs = useCallback(async (l) => { setLogged(l); await dbSet("logged", l); }, []);
-  const saveHist = useCallback(async (h) => { setHistory(h); await dbSet("history", h); }, []);
+  const saveLogs = useCallback((l) => { setLogged(l); }, []);
+  const saveHist = useCallback((h) => { setHistory(h); }, []);
 
   const curWeek = plan ? plan[activeWeeks[weekIdx]] : null;
   const curDay = curWeek?.[dayIdx];
@@ -1451,12 +1683,18 @@ function App() {
   };
 
   const handleLog = (entry) => {
+    const setNum = curLogs.length + 1;
     const newLogs = [...curLogs, entry];
     const newAll = { ...logged, [curKey]: newLogs };
     saveLogs(newAll);
     setEditingSet(null);
     setTimerLen(getRestSec(curEx.rest));
     setTimer(true);
+    // Async write to Sheets (fire and forget)
+    const exId = findExIdByName(curEx.name, exercises) || curEx.name;
+    const today = new Date().toISOString().slice(0, 10);
+    sheetsAppend("logs", [logEntryToRow(exId, setNum, entry, today)])
+      .catch(e => console.error("Sheets log sync error:", e));
   };
 
   const handleTimerDone = useCallback(() => {
@@ -1639,8 +1877,7 @@ function App() {
           <div style={{ color: "#e94560", fontWeight: 700, fontSize: 14, marginBottom: 10 }}>Danger Zone</div>
           <button onClick={async () => {
             if (confirm("Clear ALL logged workout data and history? This cannot be undone.")) {
-              await dbSet("logged", {});
-              await dbSet("history", {});
+              await sheetsOverwrite("logs", []);
               setLogged({}); setHistory({});
             }
           }} style={{

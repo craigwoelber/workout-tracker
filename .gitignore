@@ -1,0 +1,17 @@
+# Secrets — never commit
+config.js
+*.pem
+*.p12
+*.key
+
+# Environment files
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
